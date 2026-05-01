@@ -305,16 +305,22 @@ class KernelBuilder:
                 if is_last:
                     last[gi] = [final_val]
                 elif level == 0:
-                    # Next level is 1: p = val & 1 (since old p was 0, new p = 2*0 + bit)
-                    p_up = add_op("valu", ("&", p, g_val[gi], one_v), [final_val, one_bc])
-                    last[gi] = [final_val, p_up]
+                    # Next level is 1: new p = val & 1  (old p was 0, so 2*0+bit)
+                    p_up = [
+                        add_op("alu", ("&", p + lane, g_val[gi] + lane, one_s), [final_val])
+                        for lane in range(VLEN)
+                    ]
+                    last[gi] = [final_val] + p_up
                 else:
                     # p = 2*p + (val & 1)
-                    bit = add_op("valu", ("&", t1, g_val[gi], one_v), [final_val, one_bc])
+                    bit = [
+                        add_op("alu", ("&", t1 + lane, g_val[gi] + lane, one_s), [final_val])
+                        for lane in range(VLEN)
+                    ]
                     p_up = add_op(
                         "valu",
                         ("multiply_add", p, p, two_v, t1),
-                        [bit, two_bc],
+                        bit + [two_bc],
                     )
                     last[gi] = [final_val, p_up]
 
