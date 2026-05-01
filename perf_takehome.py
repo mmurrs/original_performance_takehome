@@ -147,17 +147,18 @@ class KernelBuilder:
                 self.emit({"load": slots[i : i + SLOT_LIMITS["load"]]})
 
         # ---- Init (outside the scheduled body) ----
-        const_loads = [("const", one_s, 1), ("const", two_s, 2)]
+        # Emit const loads via scheduler so they can overlap with early valu
+        # (broadcasts) and vloads.
+        const_load_ops = []  # (dest, val) tuples
+        const_load_ops.append((one_s, 1))
+        const_load_ops.append((two_s, 2))
         for (s1, s2), (c1, c2) in zip(hash_scalars, hash_const_values):
-            const_loads.append(("const", s1, c1))
-            const_loads.append(("const", s2, c2))
+            const_load_ops.append((s1, c1))
+            const_load_ops.append((s2, c2))
         for level, dest in gather_base_s.items():
-            const_loads.append(("const", dest, forest_values_p + (1 << level) - 1))
+            const_load_ops.append((dest, forest_values_p + (1 << level) - 1))
         for i, dest in enumerate(tree_s):
-            const_loads.append(("const", dest, forest_values_p + i))
-        emit_loads(const_loads)
-        # Load first 7 tree values (levels 0, 1, 2).
-        emit_loads([("load", dest, dest) for dest in tree_s])
+            const_load_ops.append((dest, forest_values_p + i))
 
         # ---- Scheduled body ----
         ops = []
@@ -167,24 +168,33 @@ class KernelBuilder:
             ops.append((engine, slot, tuple(deps)))
             return idx
 
+        # Emit const loads as scheduler ops (no deps).
+        const_ops = {}  # dest -> op_idx
+        for dest, val in const_load_ops:
+            const_ops[dest] = add_op("load", ("const", dest, val))
+        # Load the first 7 tree values (levels 0, 1, 2).
+        tree_load_ops = []
+        for dest in tree_s:
+            tree_load_ops.append(add_op("load", ("load", dest, dest), [const_ops[dest]]))
+
         # Broadcasts & level-setup subs as deps in the scheduled body, so they
         # pipeline with early group work.
-        diff_l1 = add_op("alu", ("-", l1_diff_s, tree_s[2], tree_s[1]))
-        diff_l20 = add_op("alu", ("-", l2_diff0_s, tree_s[4], tree_s[3]))
-        diff_l21 = add_op("alu", ("-", l2_diff1_s, tree_s[6], tree_s[5]))
+        diff_l1 = add_op("alu", ("-", l1_diff_s, tree_s[2], tree_s[1]), [tree_load_ops[1], tree_load_ops[2]])
+        diff_l20 = add_op("alu", ("-", l2_diff0_s, tree_s[4], tree_s[3]), [tree_load_ops[3], tree_load_ops[4]])
+        diff_l21 = add_op("alu", ("-", l2_diff1_s, tree_s[6], tree_s[5]), [tree_load_ops[5], tree_load_ops[6]])
 
-        one_bc = add_op("valu", ("vbroadcast", one_v, one_s))
-        two_bc = add_op("valu", ("vbroadcast", two_v, two_s))
+        one_bc = add_op("valu", ("vbroadcast", one_v, one_s), [const_ops[one_s]])
+        two_bc = add_op("valu", ("vbroadcast", two_v, two_s), [const_ops[two_s]])
         hc_bcs = []
         for (v1, v2), (s1, s2) in zip(hash_vecs, hash_scalars):
-            hc_bcs.append(add_op("valu", ("vbroadcast", v1, s1)))
-            hc_bcs.append(add_op("valu", ("vbroadcast", v2, s2)))
-        root_bc = add_op("valu", ("vbroadcast", root_v, tree_s[0]))
-        l1_base_bc = add_op("valu", ("vbroadcast", l1_base_v, tree_s[1]))
+            hc_bcs.append(add_op("valu", ("vbroadcast", v1, s1), [const_ops[s1]]))
+            hc_bcs.append(add_op("valu", ("vbroadcast", v2, s2), [const_ops[s2]]))
+        root_bc = add_op("valu", ("vbroadcast", root_v, tree_s[0]), [tree_load_ops[0]])
+        l1_base_bc = add_op("valu", ("vbroadcast", l1_base_v, tree_s[1]), [tree_load_ops[1]])
         l1_diff_bc = add_op("valu", ("vbroadcast", l1_diff_v, l1_diff_s), [diff_l1])
-        l20_base_bc = add_op("valu", ("vbroadcast", l2_base0_v, tree_s[3]))
+        l20_base_bc = add_op("valu", ("vbroadcast", l2_base0_v, tree_s[3]), [tree_load_ops[3]])
         l20_diff_bc = add_op("valu", ("vbroadcast", l2_diff0_v, l2_diff0_s), [diff_l20])
-        l21_base_bc = add_op("valu", ("vbroadcast", l2_base1_v, tree_s[5]))
+        l21_base_bc = add_op("valu", ("vbroadcast", l2_base1_v, tree_s[5]), [tree_load_ops[5]])
         l21_diff_bc = add_op("valu", ("vbroadcast", l2_diff1_v, l2_diff1_s), [diff_l21])
 
         hc_all_ready = hc_bcs + [one_bc, two_bc]
