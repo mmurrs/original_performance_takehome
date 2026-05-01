@@ -223,8 +223,11 @@ class KernelBuilder:
             )
             # stage 3: (a + c1) ^ (a << 9)
             h3a = add_op("valu", ("+", t1, val, hash_vecs[3][0]), [h2])
-            h3b = add_op("valu", ("<<", t2, val, hash_vecs[3][1]), [h2])
-            h3c = add_op("valu", ("^", val, t1, t2), [h3a, h3b])
+            h3b = [
+                add_op("alu", ("<<", t2 + lane, val + lane, hash_scalars[3][1]), [h2])
+                for lane in range(VLEN)
+            ]
+            h3c = add_op("valu", ("^", val, t1, t2), [h3a] + h3b)
             # stage 4: a*9 + c1
             h4 = add_op(
                 "valu",
