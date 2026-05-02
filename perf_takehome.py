@@ -86,9 +86,11 @@ class KernelBuilder:
         one_s = self.alloc_scratch("one_s")
         two_s = self.alloc_scratch("two_s")
         four_s = self.alloc_scratch("four_s")
+        eight_s = self.alloc_scratch("eight_s")
         one_v = self.alloc_scratch("one_v", VLEN)
         two_v = self.alloc_scratch("two_v", VLEN)
         four_v = self.alloc_scratch("four_v", VLEN)
+        eight_v = self.alloc_scratch("eight_v", VLEN)
 
         # Hash constants rewritten for multiply_add on stages 0,2,4:
         #   (a+c) + (a<<k) == a*(1+2**k) + c
@@ -142,6 +144,8 @@ class KernelBuilder:
         tree_s = [self.alloc_scratch(f"tree{i}_s") for i in range(7)]
         l3_tree_s = [self.alloc_scratch(f"l3_tree{i}_s") for i in range(8)]
         l3_tree_v = [self.alloc_scratch(f"l3_tree{i}_v", VLEN) for i in range(8)]
+        l4_hi_tree_s = [self.alloc_scratch(f"l4_hi_tree{i}_s") for i in range(8)]
+        l4_hi_tree_v = [self.alloc_scratch(f"l4_hi_tree{i}_v", VLEN) for i in range(8)]
         l1_diff_s = self.alloc_scratch("l1_diff_s")
         l2_diff0_s = self.alloc_scratch("l2_diff0_s")
         l2_diff1_s = self.alloc_scratch("l2_diff1_s")
@@ -160,6 +164,7 @@ class KernelBuilder:
         const_load_ops.append((one_s, 1))
         const_load_ops.append((two_s, 2))
         const_load_ops.append((four_s, 4))
+        const_load_ops.append((eight_s, 8))
         for (s1, s2), (c1, c2) in zip(hash_scalars, hash_const_values):
             const_load_ops.append((s1, c1))
             const_load_ops.append((s2, c2))
@@ -199,6 +204,7 @@ class KernelBuilder:
         one_bc = add_op("valu", ("vbroadcast", one_v, one_s), [const_ops[one_s]])
         two_bc = add_op("valu", ("vbroadcast", two_v, two_s), [const_ops[two_s]])
         four_bc = add_op("valu", ("vbroadcast", four_v, four_s), [const_ops[four_s]])
+        eight_bc = add_op("valu", ("vbroadcast", eight_v, eight_s), [const_ops[eight_s]])
         hc_bcs = []
         for (v1, v2), (s1, s2) in zip(hash_vecs, hash_scalars):
             hc_bcs.append(add_op("valu", ("vbroadcast", v1, s1), [const_ops[s1]]))
@@ -357,11 +363,9 @@ class KernelBuilder:
                     ]
                     n0 = add_op("flow", ("vselect", node, tmp1, tmp0, node), b1_alu + [r1])
 
-                    b0_hi_alu = [
-                        add_op("alu", ("&", t1 + lane, p + lane, one_s), [n0])
-                        for lane in range(VLEN)
-                    ]
-                    r2 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[5], l3_tree_v[4]), b0_hi_alu + l3_bcs[4:6])
+                    # t1 still holds b0 from b0_alu (unchanged by b1_alu/n0);
+                    # no need to recompute.
+                    r2 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[5], l3_tree_v[4]), [n0] + l3_bcs[4:6])
                     r3 = add_op("flow", ("vselect", tmp1, t1, l3_tree_v[7], l3_tree_v[6]), [r2] + l3_bcs[6:8])
                     b1_hi_alu = [
                         add_op("alu", ("&", t1 + lane, p + lane, two_s), [r3])
