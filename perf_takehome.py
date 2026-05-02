@@ -98,14 +98,14 @@ class KernelBuilder:
         hash_const_values = [
             (1 + (1 << 12), 0x7ED55D16),  # stage 0: multiply_add
             (0xC761C23C, 19),             # stage 1: xor/shift
-            (33, 0x165667B1),             # stage 2: multiply_add
-            (0xD3A2646C, 9),              # stage 3: add/shift/xor
+            (33, (0x165667B1 << 9) & 0xFFFFFFFF),  # fused stage 2/3 const
+            ((0x165667B1 + 0xD3A2646C) & 0xFFFFFFFF, 33 << 9),  # fused stage 2/3
             (9, 0xFD7046C5),              # stage 4: multiply_add
             (0xB55A4F09, 16),             # stage 5: xor/shift
         ]
         hash_scalars = []
         hash_vecs = []
-        unused_v2 = {1, 3}
+        unused_v2 = {1}
         for hi in range(6):
             s1 = self.alloc_scratch(f"hc{hi}_s1")
             s2 = self.alloc_scratch(f"hc{hi}_s2")
@@ -214,7 +214,7 @@ class KernelBuilder:
         hc_bcs = []
         for hi, ((v1, v2), (s1, s2)) in enumerate(zip(hash_vecs, hash_scalars)):
             hc_bcs.append(add_op("valu", ("vbroadcast", v1, s1), [const_ops[s1]]))
-            if hi in (1, 3):
+            if hi in (1,):
                 hc_bcs.append(const_ops[s2])
             else:
                 hc_bcs.append(add_op("valu", ("vbroadcast", v2, s2), [const_ops[s2]]))
@@ -290,26 +290,19 @@ class KernelBuilder:
                 for lane in range(VLEN)
             ]
             h1c = add_op("valu", ("^", val, t1, t2), [h1a] + h1b)
-            # stage 2: a*33 + c1
-            h2 = add_op(
+            # Fused stages 2+3:
+            # h2 = h1*33 + c2; h3 = (h2+c3) ^ (h2<<9)
+            h3a = add_op(
                 "valu",
-                ("multiply_add", val, val, hash_vecs[2][0], hash_vecs[2][1]),
+                ("multiply_add", t1, val, hash_vecs[2][0], hash_vecs[3][0]),
                 [h1c],
             )
-            # stage 3: (a + c1) ^ (a << 9)
-            if round_i in h3a_alu_rounds:
-                h3a = [
-                    add_op("alu", ("+", t1 + lane, val + lane, hash_scalars[3][0]), [h2])
-                    for lane in range(VLEN)
-                ]
-            else:
-                h3a = add_op("valu", ("+", t1, val, hash_vecs[3][0]), [h2])
-            h3b = [
-                add_op("alu", ("<<", t2 + lane, val + lane, hash_scalars[3][1]), [h2])
-                for lane in range(VLEN)
-            ]
-            h3a_deps = h3a if isinstance(h3a, list) else [h3a]
-            h3c = add_op("valu", ("^", val, t1, t2), h3a_deps + h3b)
+            h3b = add_op(
+                "valu",
+                ("multiply_add", t2, val, hash_vecs[3][1], hash_vecs[2][1]),
+                [h1c],
+            )
+            h3c = add_op("valu", ("^", val, t1, t2), [h3a, h3b])
             # stage 4: a*9 + c1
             h4 = add_op(
                 "valu",
@@ -472,6 +465,12 @@ class KernelBuilder:
             for s in succs[i]:
                 if priority[s] + 1 > priority[i]:
                     priority[i] = priority[s] + 1
+        # ASAP depth
+        asap = [0] * n_ops
+        for i in range(n_ops):
+            for d in ops[i][2]:
+                if asap[d] + 1 > asap[i]:
+                    asap[i] = asap[d] + 1
 
         ready = set(i for i, c in enumerate(indeg) if c == 0)
         remaining = n_ops
@@ -479,7 +478,7 @@ class KernelBuilder:
 
         def sort_key(i):
             engine = ops[i][0]
-            return (engine_rank[engine], -priority[i], -i)
+            return (engine_rank[engine], -priority[i], -asap[i], -i)
 
         while remaining:
             bundle = {}
