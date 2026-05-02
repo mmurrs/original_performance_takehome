@@ -86,11 +86,9 @@ class KernelBuilder:
         one_s = self.alloc_scratch("one_s")
         two_s = self.alloc_scratch("two_s")
         four_s = self.alloc_scratch("four_s")
-        eight_s = self.alloc_scratch("eight_s")
         one_v = self.alloc_scratch("one_v", VLEN)
         two_v = self.alloc_scratch("two_v", VLEN)
         four_v = self.alloc_scratch("four_v", VLEN)
-        eight_v = self.alloc_scratch("eight_v", VLEN)
 
         # Hash constants rewritten for multiply_add on stages 0,2,4:
         #   (a+c) + (a<<k) == a*(1+2**k) + c
@@ -144,14 +142,12 @@ class KernelBuilder:
         tree_s = [self.alloc_scratch(f"tree{i}_s") for i in range(7)]
         l3_tree_s = [self.alloc_scratch(f"l3_tree{i}_s") for i in range(8)]
         l3_tree_v = [self.alloc_scratch(f"l3_tree{i}_v", VLEN) for i in range(8)]
-        l4_hi_tree_s = [self.alloc_scratch(f"l4_hi_tree{i}_s") for i in range(8)]
-        l4_hi_tree_v = [self.alloc_scratch(f"l4_hi_tree{i}_v", VLEN) for i in range(8)]
         l1_diff_s = self.alloc_scratch("l1_diff_s")
         l2_diff0_s = self.alloc_scratch("l2_diff0_s")
         l2_diff1_s = self.alloc_scratch("l2_diff1_s")
-        l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(4)]
-        l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(3)]
-        l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(3)]
+        l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(2)]
+        l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(2)]
+        l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(2)]
 
         def emit_loads(slots):
             for i in range(0, len(slots), SLOT_LIMITS["load"]):
@@ -164,7 +160,6 @@ class KernelBuilder:
         const_load_ops.append((one_s, 1))
         const_load_ops.append((two_s, 2))
         const_load_ops.append((four_s, 4))
-        const_load_ops.append((eight_s, 8))
         for (s1, s2), (c1, c2) in zip(hash_scalars, hash_const_values):
             const_load_ops.append((s1, c1))
             const_load_ops.append((s2, c2))
@@ -204,7 +199,6 @@ class KernelBuilder:
         one_bc = add_op("valu", ("vbroadcast", one_v, one_s), [const_ops[one_s]])
         two_bc = add_op("valu", ("vbroadcast", two_v, two_s), [const_ops[two_s]])
         four_bc = add_op("valu", ("vbroadcast", four_v, four_s), [const_ops[four_s]])
-        eight_bc = add_op("valu", ("vbroadcast", eight_v, eight_s), [const_ops[eight_s]])
         hc_bcs = []
         for (v1, v2), (s1, s2) in zip(hash_vecs, hash_scalars):
             hc_bcs.append(add_op("valu", ("vbroadcast", v1, s1), [const_ops[s1]]))
