@@ -268,13 +268,13 @@ class KernelBuilder:
             vl = add_op("load", ("vload", g_val[gi], g_val_ptr[gi]), [pl])
             vloads.append(vl)
 
-        def add_hash(gi, val_in, node_addr, node_deps, is_last, round_i):
+        def add_hash(gi, val_in, node_addr, node_deps, val_deps, is_last, round_i):
             """Emit val = hash(val_in ^ node). Returns deps producing final val."""
             val = g_val[gi]
             t1 = g_t1[gi]
             t2 = g_t2[gi]
 
-            x0 = add_op("valu", ("^", val, val_in, node_addr), node_deps)
+            x0 = add_op("valu", ("^", val, val_in, node_addr), node_deps + val_deps)
             # stage 0: a*(1+4096) + c1
             h0 = add_op(
                 "valu",
@@ -408,8 +408,9 @@ class KernelBuilder:
                     node_addr = node
                 else:
                     # Gather: p is complemented, addr = base_c - p
+                    # NOTE: vdeps not needed — addr uses only p, base.
                     addr_op = add_op("valu", ("-", node, gather_base_v[level], p),
-                                      vdeps + pdeps + [gb_bcs[level]])
+                                      pdeps + [gb_bcs[level]])
                     loads = [
                         add_op("load", ("load_offset", node, node, lane), [addr_op])
                         for lane in range(VLEN - 1, -1, -1)
@@ -419,7 +420,7 @@ class KernelBuilder:
                     node_deps = [node_adj]
                     node_addr = node
 
-                final_val = add_hash(gi, g_val[gi], node_addr, node_deps, is_last, round_i)
+                final_val = add_hash(gi, g_val[gi], node_addr, node_deps, vdeps, is_last, round_i)
 
                 if is_last or level == forest_height:
                     last_val[gi] = [final_val]
