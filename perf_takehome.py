@@ -115,6 +115,7 @@ class KernelBuilder:
             hash_vecs.append((v1, v2))
 
         root_v = self.alloc_scratch("root_v", VLEN)
+        root_c5_v = self.alloc_scratch("root_c5_v", VLEN)
         l1_base_v = self.alloc_scratch("l1_base_v", VLEN)
         l1_val1_v = self.alloc_scratch("l1_val1_v", VLEN)
         l2_base0_v = self.alloc_scratch("l2_base0_v", VLEN)
@@ -169,7 +170,9 @@ class KernelBuilder:
             const_load_ops.append((s1, c1))
             const_load_ops.append((s2, c2))
         for level, dest in gather_base_s.items():
-            const_load_ops.append((dest, forest_values_p + (1 << level) - 1))
+            # Use complemented base: base_c = forest_values_p + 2^(L+1) - 2
+            # so that addr = base_c - p_complemented == true_addr
+            const_load_ops.append((dest, forest_values_p + (1 << (level + 1)) - 2))
         # Allocate a scratch pointer pointing to forest_values_p for the vload
         # that loads tree values (tree_s[0..6] + l3_tree_s[0..7] = 15 consecutive).
         tree_vload_ptr = self.alloc_scratch("tree_vload_ptr")
@@ -223,6 +226,17 @@ class KernelBuilder:
         l21_base_bc = add_op("valu", ("vbroadcast", l2_base1_v, tree_s[5]), [tree_load_ops[5]])
         l21_diff_bc = add_op("valu", ("vbroadcast", l2_diff1_v, tree_s[6]), [tree_load_ops[6]])
 
+        # Pre-XOR broadcasts with c5 (hash_vecs[5][0]) for lazy stage-5.
+        c5_v = hash_vecs[5][0]
+        c5_bc = hc_bcs[10]  # broadcast op of hash_vecs[5][0]
+        root_c5_bc = add_op("valu", ("^", root_c5_v, root_v, c5_v), [root_bc, c5_bc])
+        l1_base_bc = add_op("valu", ("^", l1_base_v, l1_base_v, c5_v), [l1_base_bc, c5_bc])
+        l1_val1_bc = add_op("valu", ("^", l1_val1_v, l1_val1_v, c5_v), [l1_val1_bc, c5_bc])
+        l20_base_bc = add_op("valu", ("^", l2_base0_v, l2_base0_v, c5_v), [l20_base_bc, c5_bc])
+        l20_diff_bc = add_op("valu", ("^", l2_diff0_v, l2_diff0_v, c5_v), [l20_diff_bc, c5_bc])
+        l21_base_bc = add_op("valu", ("^", l2_base1_v, l2_base1_v, c5_v), [l21_base_bc, c5_bc])
+        l21_diff_bc = add_op("valu", ("^", l2_diff1_v, l2_diff1_v, c5_v), [l21_diff_bc, c5_bc])
+
         # Broadcast gather-base scalars to vectors once.
         gb_bcs = {}
         for level, s_addr in gather_base_s.items():
@@ -231,6 +245,11 @@ class KernelBuilder:
         l3_bcs = [
             add_op("valu", ("vbroadcast", vec, scalar), [load_op])
             for vec, scalar, load_op in zip(l3_tree_v, l3_tree_s, l3_tree_load_ops)
+        ]
+        # Pre-XOR L3 tree broadcasts with c5 for lazy stage-5.
+        l3_bcs = [
+            add_op("valu", ("^", vec, vec, c5_v), [bc, c5_bc])
+            for vec, bc in zip(l3_tree_v, l3_bcs)
         ]
 
         hc_all_ready = hc_bcs + [const_ops[one_s], two_bc]
@@ -298,9 +317,15 @@ class KernelBuilder:
                 [h3c],
             )
             # stage 5: (a ^ c1) ^ (a >> 16)
-            h5a = add_op("valu", ("^", t1, val, hash_vecs[5][0]), [h4])
-            h5b = add_op("valu", (">>", t2, val, hash_vecs[5][1]), [h4])
-            h5c = add_op("valu", ("^", val, t1, t2), [h5a, h5b])
+            # stage 5 LAZY: val_stored = val_pre5 ^ (val_pre5 >> 16)
+            # Last round materializes true val via h5a + h5b + h5c.
+            if is_last:
+                h5a = add_op("valu", ("^", t1, val, hash_vecs[5][0]), [h4])
+                h5b = add_op("valu", (">>", t2, val, hash_vecs[5][1]), [h4])
+                h5c = add_op("valu", ("^", val, t1, t2), [h5a, h5b])
+            else:
+                h5b = add_op("valu", (">>", t2, val, hash_vecs[5][1]), [h4])
+                h5c = add_op("valu", ("^", val, val, t2), [h5b])
             return h5c
 
         # last_val[gi] = deps producing final_val (for val chain to next x0)
@@ -322,15 +347,19 @@ class KernelBuilder:
                 pdeps = last_p[gi]
 
                 if level == 0:
-                    # Level-0: node_addr = root_v, no p needed.
-                    node_deps = vdeps + [root_bc]
-                    node_addr = root_v
+                    # Round 0: val is initial (not lazy), use raw root.
+                    # Rounds 11+: val is val_stored (lazy), use root_c5_v.
+                    if round_i == 0:
+                        node_deps = vdeps + [root_bc]
+                        node_addr = root_v
+                    else:
+                        node_deps = vdeps + [root_c5_bc]
+                        node_addr = root_c5_v
                 elif level == 1:
-                    # p ∈ {0,1}; vselect picks between the two tree values
-                    # (precomputed as broadcasts l1_base_v and l1_base_v+diff).
+                    # p is complemented. vselect args swapped vs non-lazy.
                     sel = add_op(
                         "flow",
-                        ("vselect", node, p, l1_val1_v, l1_base_v),
+                        ("vselect", node, p, l1_base_v, l1_val1_v),
                         vdeps + pdeps + [l1_base_bc, l1_val1_bc],
                     )
                     node_deps = [sel]
@@ -342,11 +371,11 @@ class KernelBuilder:
                         b1_deps.append(l2_tmp_last[b1_tmp_i])
                     b1_addr = l2_b1_tmps[b1_tmp_i]
                     b1 = add_op("valu", ("&", b1_addr, p, two_v), b1_deps)
-                    r0 = add_op("flow", ("vselect", node, t1, l2_diff0_v, l2_base0_v),
+                    r0 = add_op("flow", ("vselect", node, t1, l2_base0_v, l2_diff0_v),
                                 vdeps + pdeps + [l20_base_bc, l20_diff_bc])
-                    r1 = add_op("flow", ("vselect", t1, t1, l2_diff1_v, l2_base1_v),
+                    r1 = add_op("flow", ("vselect", t1, t1, l2_base1_v, l2_diff1_v),
                                 [r0, l21_base_bc, l21_diff_bc])
-                    sel = add_op("flow", ("vselect", node, b1_addr, t1, node), [r1, b1])
+                    sel = add_op("flow", ("vselect", node, b1_addr, node, t1), [r1, b1])
                     l2_tmp_last[b1_tmp_i] = sel
                     node_deps = [sel]
                     node_addr = node
@@ -361,35 +390,36 @@ class KernelBuilder:
                     if l3_tmp_last[tmp_i] is not None:
                         start_deps.append(l3_tmp_last[tmp_i])
 
-                    r0 = add_op("flow", ("vselect", node, t1, l3_tree_v[1], l3_tree_v[0]), start_deps + l3_bcs[:2])
-                    r1 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[3], l3_tree_v[2]), [r0] + l3_bcs[2:4])
+                    r0 = add_op("flow", ("vselect", node, t1, l3_tree_v[0], l3_tree_v[1]), start_deps + l3_bcs[:2])
+                    r1 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[2], l3_tree_v[3]), [r0] + l3_bcs[2:4])
                     b1_alu = [
                         add_op("alu", ("&", tmp1 + lane, p + lane, two_s), [r1])
                         for lane in range(VLEN)
                     ]
-                    n0 = add_op("flow", ("vselect", node, tmp1, tmp0, node), b1_alu + [r1])
+                    n0 = add_op("flow", ("vselect", node, tmp1, node, tmp0), b1_alu + [r1])
 
                     # t1 still holds b0 from b0_alu (unchanged by b1_alu/n0);
                     # no need to recompute.
-                    r2 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[5], l3_tree_v[4]), [n0] + l3_bcs[4:6])
-                    r3 = add_op("flow", ("vselect", tmp2, t1, l3_tree_v[7], l3_tree_v[6]), [r2] + l3_bcs[6:8])
+                    r2 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[4], l3_tree_v[5]), [n0] + l3_bcs[4:6])
+                    r3 = add_op("flow", ("vselect", tmp2, t1, l3_tree_v[6], l3_tree_v[7]), [r2] + l3_bcs[6:8])
                     # tmp1 still holds b1; use it directly as cond
-                    n1 = add_op("flow", ("vselect", tmp0, tmp1, tmp2, tmp0), [r3])
+                    n1 = add_op("flow", ("vselect", tmp0, tmp1, tmp0, tmp2), [r3])
                     b2 = add_op("valu", ("&", tmp1, p, four_v), [n1, four_bc])
-                    sel = add_op("flow", ("vselect", node, tmp1, tmp0, node), [b2, n1, n0])
+                    sel = add_op("flow", ("vselect", node, tmp1, node, tmp0), [b2, n1, n0])
                     l3_tmp_last[tmp_i] = sel
                     node_deps = [sel]
                     node_addr = node
                 else:
-                    # Gather: addr = base_v + p (one fewer valu op by using
-                    # pre-broadcasted base vector)
-                    addr_op = add_op("valu", ("+", node, gather_base_v[level], p),
+                    # Gather: p is complemented, addr = base_c - p
+                    addr_op = add_op("valu", ("-", node, gather_base_v[level], p),
                                       vdeps + pdeps + [gb_bcs[level]])
                     loads = [
                         add_op("load", ("load_offset", node, node, lane), [addr_op])
                         for lane in range(VLEN - 1, -1, -1)
                     ]
-                    node_deps = loads
+                    # node_adj: XOR with c5 so val_stored ^ node_adj == true_val ^ node_raw
+                    node_adj = add_op("valu", ("^", node, node, c5_v), loads + [c5_bc])
+                    node_deps = [node_adj]
                     node_addr = node
 
                 final_val = add_hash(gi, g_val[gi], node_addr, node_deps, is_last, round_i)
