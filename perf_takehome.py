@@ -114,6 +114,7 @@ class KernelBuilder:
         root_v = self.alloc_scratch("root_v", VLEN)
         l1_base_v = self.alloc_scratch("l1_base_v", VLEN)
         l1_diff_v = self.alloc_scratch("l1_diff_v", VLEN)
+        l1_val1_v = self.alloc_scratch("l1_val1_v", VLEN)
         l2_base0_v = self.alloc_scratch("l2_base0_v", VLEN)
         l2_diff0_v = self.alloc_scratch("l2_diff0_v", VLEN)
         l2_base1_v = self.alloc_scratch("l2_base1_v", VLEN)
@@ -198,8 +199,6 @@ class KernelBuilder:
         # Broadcasts & level-setup subs as deps in the scheduled body, so they
         # pipeline with early group work.
         diff_l1 = add_op("alu", ("-", l1_diff_s, tree_s[2], tree_s[1]), [tree_load_ops[1], tree_load_ops[2]])
-        diff_l20 = add_op("alu", ("-", l2_diff0_s, tree_s[4], tree_s[3]), [tree_load_ops[3], tree_load_ops[4]])
-        diff_l21 = add_op("alu", ("-", l2_diff1_s, tree_s[6], tree_s[5]), [tree_load_ops[5], tree_load_ops[6]])
 
         one_bc = add_op("valu", ("vbroadcast", one_v, one_s), [const_ops[one_s]])
         two_bc = add_op("valu", ("vbroadcast", two_v, two_s), [const_ops[two_s]])
@@ -211,10 +210,11 @@ class KernelBuilder:
         root_bc = add_op("valu", ("vbroadcast", root_v, tree_s[0]), [tree_load_ops[0]])
         l1_base_bc = add_op("valu", ("vbroadcast", l1_base_v, tree_s[1]), [tree_load_ops[1]])
         l1_diff_bc = add_op("valu", ("vbroadcast", l1_diff_v, l1_diff_s), [diff_l1])
+        l1_val1_bc = add_op("valu", ("vbroadcast", l1_val1_v, tree_s[2]), [tree_load_ops[2]])
         l20_base_bc = add_op("valu", ("vbroadcast", l2_base0_v, tree_s[3]), [tree_load_ops[3]])
-        l20_diff_bc = add_op("valu", ("vbroadcast", l2_diff0_v, l2_diff0_s), [diff_l20])
+        l20_diff_bc = add_op("valu", ("vbroadcast", l2_diff0_v, tree_s[4]), [tree_load_ops[4]])
         l21_base_bc = add_op("valu", ("vbroadcast", l2_base1_v, tree_s[5]), [tree_load_ops[5]])
-        l21_diff_bc = add_op("valu", ("vbroadcast", l2_diff1_v, l2_diff1_s), [diff_l21])
+        l21_diff_bc = add_op("valu", ("vbroadcast", l2_diff1_v, tree_s[6]), [tree_load_ops[6]])
 
         # Broadcast gather-base scalars to vectors once.
         gb_bcs = {}
@@ -312,37 +312,28 @@ class KernelBuilder:
                     node_deps = vdeps + [root_bc]
                     node_addr = root_v
                 elif level == 1:
+                    # p ∈ {0,1}; vselect picks between the two tree values
+                    # (precomputed as broadcasts l1_base_v and l1_base_v+diff).
                     sel = add_op(
-                        "valu",
-                        ("multiply_add", node, l1_diff_v, p, l1_base_v),
-                        vdeps + pdeps + [l1_base_bc, l1_diff_bc],
+                        "flow",
+                        ("vselect", node, p, l1_val1_v, l1_base_v),
+                        vdeps + pdeps + [l1_base_bc, l1_val1_bc],
                     )
                     node_deps = [sel]
                     node_addr = node
                 elif level == 2:
                     b0 = add_op("valu", ("&", t1, p, one_v), vdeps + pdeps + [one_bc])
                     b1_tmp_i = gi % len(l2_b1_tmps)
-                    b1_deps = vdeps + pdeps + [one_bc]
+                    b1_deps = vdeps + pdeps + [two_bc]
                     if l2_tmp_last[b1_tmp_i] is not None:
                         b1_deps.append(l2_tmp_last[b1_tmp_i])
                     b1_addr = l2_b1_tmps[b1_tmp_i]
-                    b1 = add_op("valu", (">>", b1_addr, p, one_v), b1_deps)
-                    r0 = add_op(
-                        "valu",
-                        ("multiply_add", node, l2_diff0_v, t1, l2_base0_v),
-                        [b0, l20_base_bc, l20_diff_bc],
-                    )
-                    r1 = add_op(
-                        "valu",
-                        ("multiply_add", t1, l2_diff1_v, t1, l2_base1_v),
-                        [b0, l21_base_bc, l21_diff_bc],
-                    )
-                    diff = add_op("valu", ("-", t1, t1, node), [r0, r1])
-                    sel = add_op(
-                        "valu",
-                        ("multiply_add", node, t1, b1_addr, node),
-                        [diff, b1],
-                    )
+                    b1 = add_op("valu", ("&", b1_addr, p, two_v), b1_deps)
+                    r0 = add_op("flow", ("vselect", node, t1, l2_diff0_v, l2_base0_v),
+                                [b0, l20_base_bc, l20_diff_bc])
+                    r1 = add_op("flow", ("vselect", t1, t1, l2_diff1_v, l2_base1_v),
+                                [r0, l21_base_bc, l21_diff_bc])
+                    sel = add_op("flow", ("vselect", node, b1_addr, t1, node), [r1, b1])
                     l2_tmp_last[b1_tmp_i] = sel
                     node_deps = [sel]
                     node_addr = node
