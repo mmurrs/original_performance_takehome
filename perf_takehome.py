@@ -347,10 +347,10 @@ class KernelBuilder:
                     # Round 0: val is initial (not lazy), use raw root.
                     # Rounds 11+: val is val_stored (lazy), use root_c5_v.
                     if round_i == 0:
-                        node_deps = vdeps + [root_bc]
+                        node_deps = [root_bc]
                         node_addr = root_v
                     else:
-                        node_deps = vdeps + [root_c5_bc]
+                        node_deps = [root_c5_bc]
                         node_addr = root_c5_v
                 elif level == 1:
                     # p is complemented. vselect args swapped vs non-lazy.
