@@ -121,7 +121,7 @@ class KernelBuilder:
 
         # Per-level base pointer into forest_values for gathered levels.
         gather_base_s = {}
-        for level in range(3, forest_height + 1):
+        for level in range(4, forest_height + 1):
             gather_base_s[level] = self.alloc_scratch(f"gb{level}_s")
         # Pre-broadcast gather bases once at setup (saves 1 valu/group/round).
         gather_base_v = {}
@@ -152,6 +152,7 @@ class KernelBuilder:
         l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(2)]
         l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(2)]
         l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(2)]
+        l3_tmp2 = [self.alloc_scratch(f"l3_tmp2_{i}", VLEN) for i in range(2)]
 
         def emit_loads(slots):
             for i in range(0, len(slots), SLOT_LIMITS["load"]):
@@ -351,6 +352,7 @@ class KernelBuilder:
                     tmp_i = gi % len(l3_tmp0)
                     tmp0 = l3_tmp0[tmp_i]
                     tmp1 = l3_tmp1[tmp_i]
+                    tmp2 = l3_tmp2[tmp_i]
                     start_deps = vdeps + pdeps + [one_bc]
                     if l3_tmp_last[tmp_i] is not None:
                         start_deps.append(l3_tmp_last[tmp_i])
@@ -370,17 +372,11 @@ class KernelBuilder:
                     # t1 still holds b0 from b0_alu (unchanged by b1_alu/n0);
                     # no need to recompute.
                     r2 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[5], l3_tree_v[4]), [n0] + l3_bcs[4:6])
-                    r3 = add_op("flow", ("vselect", tmp1, t1, l3_tree_v[7], l3_tree_v[6]), [r2] + l3_bcs[6:8])
-                    b1_hi_alu = [
-                        add_op("alu", ("&", t1 + lane, p + lane, two_s), [r3])
-                        for lane in range(VLEN)
-                    ]
-                    n1 = add_op("flow", ("vselect", tmp0, t1, tmp1, tmp0), b1_hi_alu + [r3])
-                    b2_alu = [
-                        add_op("alu", ("&", tmp1 + lane, p + lane, four_s), [n1])
-                        for lane in range(VLEN)
-                    ]
-                    sel = add_op("flow", ("vselect", node, tmp1, tmp0, node), b2_alu + [n1, n0])
+                    r3 = add_op("flow", ("vselect", tmp2, t1, l3_tree_v[7], l3_tree_v[6]), [r2] + l3_bcs[6:8])
+                    # tmp1 still holds b1; use it directly as cond
+                    n1 = add_op("flow", ("vselect", tmp0, tmp1, tmp2, tmp0), [r3])
+                    b2 = add_op("valu", ("&", tmp1, p, four_v), [n1, four_bc])
+                    sel = add_op("flow", ("vselect", node, tmp1, tmp0, node), [b2, n1, n0])
                     l3_tmp_last[tmp_i] = sel
                     node_deps = [sel]
                     node_addr = node
