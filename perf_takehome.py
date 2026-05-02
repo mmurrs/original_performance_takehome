@@ -82,7 +82,7 @@ class KernelBuilder:
         forest_values_p = 7
         inp_values_p = forest_values_p + n_nodes + batch_size
         h3a_alu_rounds = set()
-        p_bit_valu_rounds = {9, 14}
+        p_bit_valu_rounds = set()
 
         # ---- scratch allocations ----
         one_s = self.alloc_scratch("one_s")
