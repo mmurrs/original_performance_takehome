@@ -239,11 +239,11 @@ class KernelBuilder:
         ptr_loads = []
         vloads = []
         for gi in range(n_groups):
-            if gi == 0:
-                # ptr[0] = val_base + 0 via flow
-                pl = add_op("flow", ("add_imm", g_val_ptr[gi], val_base_s, 0), [const_ops[val_base_s]])
-            else:
+            # Mix: every other group via flow, rest via load to balance engines
+            if gi % 2 == 0:
                 pl = add_op("flow", ("add_imm", g_val_ptr[gi], val_base_s, gi * VLEN), [const_ops[val_base_s]])
+            else:
+                pl = add_op("load", ("const", g_val_ptr[gi], inp_values_p + gi * VLEN))
             ptr_loads.append(pl)
             vl = add_op("load", ("vload", g_val[gi], g_val_ptr[gi]), [pl])
             vloads.append(vl)
