@@ -81,6 +81,7 @@ class KernelBuilder:
         n_groups = batch_size // VLEN
         forest_values_p = 7
         inp_values_p = forest_values_p + n_nodes + batch_size
+        h3a_alu_rounds = {15}
 
         # ---- scratch allocations ----
         one_s = self.alloc_scratch("one_s")
@@ -247,7 +248,7 @@ class KernelBuilder:
             vl = add_op("load", ("vload", g_val[gi], g_val_ptr[gi]), [pl])
             vloads.append(vl)
 
-        def add_hash(gi, val_in, node_addr, node_deps, is_last):
+        def add_hash(gi, val_in, node_addr, node_deps, is_last, round_i):
             """Emit val = hash(val_in ^ node). Returns deps producing final val."""
             val = g_val[gi]
             t1 = g_t1[gi]
@@ -274,12 +275,19 @@ class KernelBuilder:
                 [h1c],
             )
             # stage 3: (a + c1) ^ (a << 9)
-            h3a = add_op("valu", ("+", t1, val, hash_vecs[3][0]), [h2])
+            if round_i in h3a_alu_rounds:
+                h3a = [
+                    add_op("alu", ("+", t1 + lane, val + lane, hash_scalars[3][0]), [h2])
+                    for lane in range(VLEN)
+                ]
+            else:
+                h3a = add_op("valu", ("+", t1, val, hash_vecs[3][0]), [h2])
             h3b = [
                 add_op("alu", ("<<", t2 + lane, val + lane, hash_scalars[3][1]), [h2])
                 for lane in range(VLEN)
             ]
-            h3c = add_op("valu", ("^", val, t1, t2), [h3a] + h3b)
+            h3a_deps = h3a if isinstance(h3a, list) else [h3a]
+            h3c = add_op("valu", ("^", val, t1, t2), h3a_deps + h3b)
             # stage 4: a*9 + c1
             h4 = add_op(
                 "valu",
@@ -381,7 +389,7 @@ class KernelBuilder:
                     node_deps = loads
                     node_addr = node
 
-                final_val = add_hash(gi, g_val[gi], node_addr, node_deps, is_last)
+                final_val = add_hash(gi, g_val[gi], node_addr, node_deps, is_last, round_i)
 
                 if is_last or level == forest_height:
                     last_val[gi] = [final_val]
