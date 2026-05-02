@@ -155,7 +155,6 @@ class KernelBuilder:
         l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(2)]
         l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(2)]
         l3_tmp2 = [self.alloc_scratch(f"l3_tmp2_{i}", VLEN) for i in range(2)]
-        l4_tree_v = [self.alloc_scratch(f"l4_tree{i}_v", VLEN) for i in range(16)]
 
         def emit_loads(slots):
             for i in range(0, len(slots), SLOT_LIMITS["load"]):
@@ -205,19 +204,6 @@ class KernelBuilder:
         tree_load_ops = [v1] * 7  # tree_s[0..6] all loaded by v1
         l3_tree_load_ops = [v2] * 8  # l3_tree_s[0..7] all loaded by v2
 
-        # Level 4 has 16 nodes at forest_values_p+15..30. Preload into l4_tree_v
-        # broadcasts for use in L4 arith-select (hybrid with gather). We vload
-        # directly into the first two broadcast vectors' scratch (re-purposing
-        # them as 8-word scalar buffers), then broadcast each scalar to make
-        # the remaining broadcast vectors. Saves scratch by avoiding temp buffer.
-        l4_inc_a = add_op("flow", ("add_imm", tree_vload_ptr, tree_vload_ptr, 15), [v1])
-        l4_inc_b = add_op("flow", ("add_imm", tree_vload_ptr_2, tree_vload_ptr_2, 16), [v2])
-        l4_vload_a = add_op("load", ("vload", l4_tree_v[0], tree_vload_ptr), [l4_inc_a])
-        l4_vload_b = add_op("load", ("vload", l4_tree_v[8], tree_vload_ptr_2), [l4_inc_b])
-        # Reuse tree_vload_ptr slot to hold constant 8 for bit-3 extraction in L4.
-        eight_s = tree_vload_ptr  # alias
-        eight_const = add_op("load", ("const", eight_s, 8), [l4_vload_a])
-
         # Broadcasts & level-setup subs as deps in the scheduled body, so they
         # pipeline with early group work.
         one_bc = (
@@ -266,36 +252,6 @@ class KernelBuilder:
             add_op("valu", ("^", vec, vec, c5_v), [bc, c5_bc])
             for vec, bc in zip(l3_tree_v, l3_bcs)
         ]
-
-        # Build l4_bcs: broadcast each of the 16 tree values (currently in the
-        # 8 scalar slots of l4_tree_v[0] and l4_tree_v[8]) to their own vector.
-        # Do the non-base first so l4_tree_v[0]/l4_tree_v[8] can be overwritten
-        # last with their broadcast.
-        l4_bcs = [None] * 16
-        l4_first_half_reads = []
-        for k in range(1, 8):
-            bc = add_op("valu", ("vbroadcast", l4_tree_v[k], l4_tree_v[0] + k),
-                        [l4_vload_a])
-            l4_first_half_reads.append(bc)
-            l4_bcs[k] = add_op("valu", ("^", l4_tree_v[k], l4_tree_v[k], c5_v),
-                               [bc, c5_bc])
-        # Now broadcast lane 0 of l4_tree_v[0] onto itself.
-        bc0 = add_op("valu", ("vbroadcast", l4_tree_v[0], l4_tree_v[0]),
-                     [l4_vload_a] + l4_first_half_reads)
-        l4_bcs[0] = add_op("valu", ("^", l4_tree_v[0], l4_tree_v[0], c5_v),
-                           [bc0, c5_bc])
-        # Second half.
-        l4_second_half_reads = []
-        for k in range(9, 16):
-            bc = add_op("valu", ("vbroadcast", l4_tree_v[k], l4_tree_v[8] + (k - 8)),
-                        [l4_vload_b])
-            l4_second_half_reads.append(bc)
-            l4_bcs[k] = add_op("valu", ("^", l4_tree_v[k], l4_tree_v[k], c5_v),
-                               [bc, c5_bc])
-        bc8 = add_op("valu", ("vbroadcast", l4_tree_v[8], l4_tree_v[8]),
-                     [l4_vload_b] + l4_second_half_reads)
-        l4_bcs[8] = add_op("valu", ("^", l4_tree_v[8], l4_tree_v[8], c5_v),
-                           [bc8, c5_bc])
 
         # g_val_ptr: base + gi*VLEN. Compute via flow add_imm (free engine)
         # to avoid using 32 load slots for consts.
@@ -453,93 +409,16 @@ class KernelBuilder:
                     node_addr = node
                 else:
                     # Gather: p is complemented, addr = base_c - p
-                    # HYBRID: for round 4 first L4_SELECT_N groups, use 16-way vselect tree
-                    # on preloaded broadcasts (cuts gather loads, adds flow vselects).
-                    L4_SELECT_N = 0
-                    if level == 4 and round_i == 4 and gi < L4_SELECT_N:
-                        tmp_i = gi % len(l3_tmp0)
-                        tmp0 = l3_tmp0[tmp_i]
-                        tmp1 = l3_tmp1[tmp_i]
-                        tmp2 = l3_tmp2[tmp_i]
-                        start_deps = vdeps + pdeps
-                        if l3_tmp_last[tmp_i] is not None:
-                            start_deps.append(l3_tmp_last[tmp_i])
-                        # Compute bits b0, b1, b2, b3 from p. b0 is in t1 from L3...
-                        # actually no, t1 not carried over. Compute fresh.
-                        b0_alu = [
-                            add_op("alu", ("&", t1 + lane, p + lane, one_s), start_deps)
-                            for lane in range(VLEN)
-                        ]
-                        # Build 16-way tree from l4_tree_v[0..15] using b0 (bit 0 of p).
-                        # Quad select within each pair: r[2i..2i+1] selection by b0.
-                        # First 4 pairs → tmp0 (then combine via b1 → block0)
-                        r01 = add_op("flow", ("vselect", node, t1, l4_tree_v[0], l4_tree_v[1]),
-                                     b0_alu + [l4_bcs[0], l4_bcs[1]])
-                        r23 = add_op("flow", ("vselect", tmp0, t1, l4_tree_v[2], l4_tree_v[3]),
-                                     b0_alu + [l4_bcs[2], l4_bcs[3]])
-                        b1_alu = [
-                            add_op("alu", ("&", tmp1 + lane, p + lane, two_s), [r23])
-                            for lane in range(VLEN)
-                        ]
-                        block0 = add_op("flow", ("vselect", node, tmp1, node, tmp0),
-                                        b1_alu + [r01, r23])
-                        r45 = add_op("flow", ("vselect", tmp0, t1, l4_tree_v[4], l4_tree_v[5]),
-                                     [block0] + b0_alu + [l4_bcs[4], l4_bcs[5]])
-                        r67 = add_op("flow", ("vselect", tmp2, t1, l4_tree_v[6], l4_tree_v[7]),
-                                     b0_alu + [l4_bcs[6], l4_bcs[7]])
-                        block1 = add_op("flow", ("vselect", tmp0, tmp1, tmp0, tmp2),
-                                        [r45, r67])
-                        b2_alu = [
-                            add_op("alu", ("&", tmp2 + lane, p + lane, four_s), [block1])
-                            for lane in range(VLEN)
-                        ]
-                        half0 = add_op("flow", ("vselect", node, tmp2, node, tmp0),
-                                       b2_alu + [block0, block1])
-                        # Second half (nodes 8..15).
-                        r89 = add_op("flow", ("vselect", tmp0, t1, l4_tree_v[8], l4_tree_v[9]),
-                                     [half0] + b0_alu + [l4_bcs[8], l4_bcs[9]])
-                        r1011 = add_op("flow", ("vselect", tmp2, t1, l4_tree_v[10], l4_tree_v[11]),
-                                       b0_alu + [l4_bcs[10], l4_bcs[11]])
-                        block2 = add_op("flow", ("vselect", tmp0, tmp1, tmp0, tmp2),
-                                        [r89, r1011])
-                        r1213 = add_op("flow", ("vselect", tmp2, t1, l4_tree_v[12], l4_tree_v[13]),
-                                       [block2] + b0_alu + [l4_bcs[12], l4_bcs[13]])
-                        r1415 = add_op("flow", ("vselect", tmp1, t1, l4_tree_v[14], l4_tree_v[15]),
-                                       b0_alu + [l4_bcs[14], l4_bcs[15]])
-                        # block3 combines via b1 again (recompute since tmp1 got used)
-                        b1b_alu = [
-                            add_op("alu", ("&", t1 + lane, p + lane, two_s), [r1415])
-                            for lane in range(VLEN)
-                        ]
-                        block3 = add_op("flow", ("vselect", tmp2, t1, tmp2, tmp1),
-                                        b1b_alu + [block2])
-                        b2b_alu = [
-                            add_op("alu", ("&", tmp1 + lane, p + lane, four_s), [block3])
-                            for lane in range(VLEN)
-                        ]
-                        half1 = add_op("flow", ("vselect", tmp0, tmp1, tmp0, tmp2),
-                                       b2b_alu + [block2, block3])
-                        # Final: select between half0 and half1 via b3 (p & 8).
-                        b3_alu = [
-                            add_op("alu", ("&", tmp1 + lane, p + lane, eight_s), [half1, eight_const])
-                            for lane in range(VLEN)
-                        ]
-                        sel = add_op("flow", ("vselect", node, tmp1, node, tmp0),
-                                     b3_alu + [half0, half1])
-                        l3_tmp_last[tmp_i] = sel
-                        node_deps = [sel]
-                        node_addr = node
-                    else:
-                        addr_op = add_op("valu", ("-", node, gather_base_v[level], p),
-                                          vdeps + pdeps + [gb_bcs[level]])
-                        loads = [
-                            add_op("load", ("load_offset", node, node, lane), [addr_op])
-                            for lane in range(VLEN - 1, -1, -1)
-                        ]
-                        # node_adj: XOR with c5 so val_stored ^ node_adj == true_val ^ node_raw
-                        node_adj = add_op("valu", ("^", node, node, c5_v), loads + [c5_bc])
-                        node_deps = [node_adj]
-                        node_addr = node
+                    addr_op = add_op("valu", ("-", node, gather_base_v[level], p),
+                                      vdeps + pdeps + [gb_bcs[level]])
+                    loads = [
+                        add_op("load", ("load_offset", node, node, lane), [addr_op])
+                        for lane in range(VLEN - 1, -1, -1)
+                    ]
+                    # node_adj: XOR with c5 so val_stored ^ node_adj == true_val ^ node_raw
+                    node_adj = add_op("valu", ("^", node, node, c5_v), loads + [c5_bc])
+                    node_deps = [node_adj]
+                    node_addr = node
 
                 final_val = add_hash(gi, g_val[gi], node_addr, node_deps, is_last, round_i)
 
