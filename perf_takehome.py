@@ -82,7 +82,7 @@ class KernelBuilder:
         forest_values_p = 7
         inp_values_p = forest_values_p + n_nodes + batch_size
         h3a_alu_rounds = set()
-        p_bit_valu_rounds = set()
+        p_bit_valu_rounds = {0, 1}
 
         # ---- scratch allocations ----
         one_s = self.alloc_scratch("one_s")
@@ -314,11 +314,17 @@ class KernelBuilder:
             # Last round materializes true val via h5a + h5b + h5c.
             if is_last:
                 h5a = add_op("valu", ("^", t1, val, hash_vecs[5][0]), [h4])
-                h5b = add_op("valu", (">>", t2, val, hash_vecs[5][1]), [h4])
-                h5c = add_op("valu", ("^", val, t1, t2), [h5a, h5b])
+                h5b = [
+                    add_op("alu", (">>", t2 + lane, val + lane, hash_scalars[5][1]), [h4])
+                    for lane in range(VLEN)
+                ]
+                h5c = add_op("valu", ("^", val, t1, t2), [h5a] + h5b)
             else:
-                h5b = add_op("valu", (">>", t2, val, hash_vecs[5][1]), [h4])
-                h5c = add_op("valu", ("^", val, val, t2), [h5b])
+                h5b = [
+                    add_op("alu", (">>", t2 + lane, val + lane, hash_scalars[5][1]), [h4])
+                    for lane in range(VLEN)
+                ]
+                h5c = add_op("valu", ("^", val, val, t2), h5b)
             return h5c
 
         # last_val[gi] = deps producing final_val (for val chain to next x0)
