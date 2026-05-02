@@ -155,7 +155,8 @@ class KernelBuilder:
         for level in gather_base_s:
             gather_base_v[level] = self.alloc_scratch(f"gb{level}_v", VLEN)
 
-        # Per-group state
+        # Per-group state. g_val_ptr aliases lane 0 of g_p (only used before p
+        # init + after final p use; vstore recomputes via add_imm)
         g_p = []
         g_val = []
         g_node = []
@@ -168,7 +169,7 @@ class KernelBuilder:
             g_node.append(self.alloc_scratch(f"g{gi}_node", VLEN))
             g_t1.append(self.alloc_scratch(f"g{gi}_t1", VLEN))
             g_t2.append(g_node[-1])
-            g_val_ptr.append(self.alloc_scratch(f"g{gi}_vp"))
+            g_val_ptr.append(g_p[-1])  # alias g_val_ptr with g_p lane 0
 
         tree_s = [self.alloc_scratch(f"tree{i}_s") for i in range(7)]
         l3_tree_s = [self.alloc_scratch(f"l3_tree{i}_s") for i in range(8)]
@@ -474,9 +475,16 @@ class KernelBuilder:
                     last_val[gi] = [final_val]
                     last_p[gi] = [p_up]
 
-        # Store final values back.
+        # Store final values back. Recompute g_val_ptr via flow add_imm since
+        # it aliased g_p (which got overwritten during the rounds).
         for gi in range(n_groups):
-            add_op("store", ("vstore", g_val_ptr[gi], g_val[gi]), last_val[gi])
+            store_ptr = add_op(
+                "flow",
+                ("add_imm", g_val_ptr[gi], val_base_s, gi * VLEN),
+                last_val[gi] + [const_ops[val_base_s]],
+            )
+            add_op("store", ("vstore", g_val_ptr[gi], g_val[gi]),
+                   last_val[gi] + [store_ptr])
 
         # ---- List scheduler: earliest-ready, engine-packed ----
         n_ops = len(ops)
