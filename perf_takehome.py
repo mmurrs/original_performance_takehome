@@ -123,6 +123,10 @@ class KernelBuilder:
         gather_base_s = {}
         for level in range(3, forest_height + 1):
             gather_base_s[level] = self.alloc_scratch(f"gb{level}_s")
+        # Pre-broadcast gather bases once at setup (saves 1 valu/group/round).
+        gather_base_v = {}
+        for level in gather_base_s:
+            gather_base_v[level] = self.alloc_scratch(f"gb{level}_v", VLEN)
 
         # Per-group state
         g_p = []
@@ -210,6 +214,12 @@ class KernelBuilder:
         l20_diff_bc = add_op("valu", ("vbroadcast", l2_diff0_v, l2_diff0_s), [diff_l20])
         l21_base_bc = add_op("valu", ("vbroadcast", l2_base1_v, tree_s[5]), [tree_load_ops[5]])
         l21_diff_bc = add_op("valu", ("vbroadcast", l2_diff1_v, l2_diff1_s), [diff_l21])
+
+        # Broadcast gather-base scalars to vectors once.
+        gb_bcs = {}
+        for level, s_addr in gather_base_s.items():
+            gb_bcs[level] = add_op("valu", ("vbroadcast", gather_base_v[level], s_addr),
+                                    [const_ops[s_addr]])
         l3_bcs = [
             add_op("valu", ("vbroadcast", vec, scalar), [load_op])
             for vec, scalar, load_op in zip(l3_tree_v, l3_tree_s, l3_tree_load_ops)
@@ -375,8 +385,10 @@ class KernelBuilder:
                     node_deps = [sel]
                     node_addr = node
                 else:
-                    bc = add_op("valu", ("vbroadcast", node, gather_base_s[level]), vdeps)
-                    addr_op = add_op("valu", ("+", node, node, p), [bc] + pdeps)
+                    # Gather: addr = base_v + p (one fewer valu op by using
+                    # pre-broadcasted base vector)
+                    addr_op = add_op("valu", ("+", node, gather_base_v[level], p),
+                                      vdeps + pdeps + [gb_bcs[level]])
                     loads = [
                         add_op("load", ("load_offset", node, node, lane), [addr_op])
                         for lane in range(VLEN)
