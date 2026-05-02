@@ -105,11 +105,12 @@ class KernelBuilder:
         ]
         hash_scalars = []
         hash_vecs = []
+        unused_v2 = {1, 3}
         for hi in range(6):
             s1 = self.alloc_scratch(f"hc{hi}_s1")
             s2 = self.alloc_scratch(f"hc{hi}_s2")
             v1 = self.alloc_scratch(f"hc{hi}_v1", VLEN)
-            v2 = self.alloc_scratch(f"hc{hi}_v2", VLEN)
+            v2 = None if hi in unused_v2 else self.alloc_scratch(f"hc{hi}_v2", VLEN)
             hash_scalars.append((s1, s2))
             hash_vecs.append((v1, v2))
 
