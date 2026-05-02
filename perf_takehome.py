@@ -85,8 +85,10 @@ class KernelBuilder:
         # ---- scratch allocations ----
         one_s = self.alloc_scratch("one_s")
         two_s = self.alloc_scratch("two_s")
+        four_s = self.alloc_scratch("four_s")
         one_v = self.alloc_scratch("one_v", VLEN)
         two_v = self.alloc_scratch("two_v", VLEN)
+        four_v = self.alloc_scratch("four_v", VLEN)
 
         # Hash constants rewritten for multiply_add on stages 0,2,4:
         #   (a+c) + (a<<k) == a*(1+2**k) + c
@@ -134,13 +136,18 @@ class KernelBuilder:
             g_val.append(self.alloc_scratch(f"g{gi}_val", VLEN))
             g_node.append(self.alloc_scratch(f"g{gi}_node", VLEN))
             g_t1.append(self.alloc_scratch(f"g{gi}_t1", VLEN))
-            g_t2.append(self.alloc_scratch(f"g{gi}_t2", VLEN))
+            g_t2.append(g_node[-1])
             g_val_ptr.append(self.alloc_scratch(f"g{gi}_vp"))
 
         tree_s = [self.alloc_scratch(f"tree{i}_s") for i in range(7)]
+        l3_tree_s = [self.alloc_scratch(f"l3_tree{i}_s") for i in range(8)]
+        l3_tree_v = [self.alloc_scratch(f"l3_tree{i}_v", VLEN) for i in range(8)]
         l1_diff_s = self.alloc_scratch("l1_diff_s")
         l2_diff0_s = self.alloc_scratch("l2_diff0_s")
         l2_diff1_s = self.alloc_scratch("l2_diff1_s")
+        l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(6)]
+        l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(6)]
+        l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(6)]
 
         def emit_loads(slots):
             for i in range(0, len(slots), SLOT_LIMITS["load"]):
@@ -152,6 +159,7 @@ class KernelBuilder:
         const_load_ops = []  # (dest, val) tuples
         const_load_ops.append((one_s, 1))
         const_load_ops.append((two_s, 2))
+        const_load_ops.append((four_s, 4))
         for (s1, s2), (c1, c2) in zip(hash_scalars, hash_const_values):
             const_load_ops.append((s1, c1))
             const_load_ops.append((s2, c2))
@@ -159,6 +167,8 @@ class KernelBuilder:
             const_load_ops.append((dest, forest_values_p + (1 << level) - 1))
         for i, dest in enumerate(tree_s):
             const_load_ops.append((dest, forest_values_p + i))
+        for i, dest in enumerate(l3_tree_s):
+            const_load_ops.append((dest, forest_values_p + 7 + i))
 
         # ---- Scheduled body ----
         ops = []
@@ -176,6 +186,9 @@ class KernelBuilder:
         tree_load_ops = []
         for dest in tree_s:
             tree_load_ops.append(add_op("load", ("load", dest, dest), [const_ops[dest]]))
+        l3_tree_load_ops = []
+        for dest in l3_tree_s:
+            l3_tree_load_ops.append(add_op("load", ("load", dest, dest), [const_ops[dest]]))
 
         # Broadcasts & level-setup subs as deps in the scheduled body, so they
         # pipeline with early group work.
@@ -185,6 +198,7 @@ class KernelBuilder:
 
         one_bc = add_op("valu", ("vbroadcast", one_v, one_s), [const_ops[one_s]])
         two_bc = add_op("valu", ("vbroadcast", two_v, two_s), [const_ops[two_s]])
+        four_bc = add_op("valu", ("vbroadcast", four_v, four_s), [const_ops[four_s]])
         hc_bcs = []
         for (v1, v2), (s1, s2) in zip(hash_vecs, hash_scalars):
             hc_bcs.append(add_op("valu", ("vbroadcast", v1, s1), [const_ops[s1]]))
@@ -196,6 +210,10 @@ class KernelBuilder:
         l20_diff_bc = add_op("valu", ("vbroadcast", l2_diff0_v, l2_diff0_s), [diff_l20])
         l21_base_bc = add_op("valu", ("vbroadcast", l2_base1_v, tree_s[5]), [tree_load_ops[5]])
         l21_diff_bc = add_op("valu", ("vbroadcast", l2_diff1_v, l2_diff1_s), [diff_l21])
+        l3_bcs = [
+            add_op("valu", ("vbroadcast", vec, scalar), [load_op])
+            for vec, scalar, load_op in zip(l3_tree_v, l3_tree_s, l3_tree_load_ops)
+        ]
 
         hc_all_ready = hc_bcs + [one_bc, two_bc]
 
@@ -260,8 +278,12 @@ class KernelBuilder:
             h5c = add_op("valu", ("^", val, t1, t2), [h5a, h5b])
             return h5c
 
-        # last[gi] = list of op-idx producing the group's val (dep chain tail)
-        last = [[vl] + hc_all_ready for vl in vloads]
+        # last_val[gi] = deps producing final_val (for val chain to next x0)
+        # last_p[gi]   = deps producing latest p_up (for p-reading in next round)
+        last_val = [[vl] + hc_all_ready for vl in vloads]
+        last_p = [[] for _ in range(n_groups)]
+        l2_tmp_last = [None] * len(l2_b1_tmps)
+        l3_tmp_last = [None] * len(l3_tmp0)
 
         for round_i in range(rounds):
             level = round_i % (forest_height + 1)
@@ -271,31 +293,34 @@ class KernelBuilder:
                 node = g_node[gi]
                 t1 = g_t1[gi]
                 t2 = g_t2[gi]
-                prev = last[gi]
+                vdeps = last_val[gi]
+                pdeps = last_p[gi]
 
                 if level == 0:
-                    node_deps = prev + [root_bc]
+                    # Level-0: node_addr = root_v, no p needed.
+                    node_deps = vdeps + [root_bc]
                     node_addr = root_v
                 elif level == 1:
-                    # node = l1_base + p * l1_diff  (p ∈ {0,1})
                     sel = add_op(
                         "valu",
                         ("multiply_add", node, l1_diff_v, p, l1_base_v),
-                        prev + [l1_base_bc, l1_diff_bc],
+                        vdeps + pdeps + [l1_base_bc, l1_diff_bc],
                     )
                     node_deps = [sel]
                     node_addr = node
                 elif level == 2:
-                    # p ∈ {0..3}; bits b0=p&1, b1=(p>>1)&1
-                    b0 = add_op("valu", ("&", t1, p, one_v), prev + [one_bc])
-                    b1 = add_op("valu", (">>", t2, p, one_v), prev + [one_bc])
-                    # r0 = l2_base0 + b0 * l2_diff0
+                    b0 = add_op("valu", ("&", t1, p, one_v), vdeps + pdeps + [one_bc])
+                    b1_tmp_i = gi % len(l2_b1_tmps)
+                    b1_deps = vdeps + pdeps + [one_bc]
+                    if l2_tmp_last[b1_tmp_i] is not None:
+                        b1_deps.append(l2_tmp_last[b1_tmp_i])
+                    b1_addr = l2_b1_tmps[b1_tmp_i]
+                    b1 = add_op("valu", (">>", b1_addr, p, one_v), b1_deps)
                     r0 = add_op(
                         "valu",
                         ("multiply_add", node, l2_diff0_v, t1, l2_base0_v),
                         [b0, l20_base_bc, l20_diff_bc],
                     )
-                    # r1 = l2_base1 + b0 * l2_diff1
                     r1 = add_op(
                         "valu",
                         ("multiply_add", t1, l2_diff1_v, t1, l2_base1_v),
@@ -304,15 +329,41 @@ class KernelBuilder:
                     diff = add_op("valu", ("-", t1, t1, node), [r0, r1])
                     sel = add_op(
                         "valu",
-                        ("multiply_add", node, t1, t2, node),
+                        ("multiply_add", node, t1, b1_addr, node),
                         [diff, b1],
                     )
+                    l2_tmp_last[b1_tmp_i] = sel
+                    node_deps = [sel]
+                    node_addr = node
+                elif level == 3:
+                    # Eight possible nodes exist at level 3, so select from
+                    # broadcasts instead of repeating scatter loads per item.
+                    tmp_i = gi % len(l3_tmp0)
+                    tmp0 = l3_tmp0[tmp_i]
+                    tmp1 = l3_tmp1[tmp_i]
+                    start_deps = vdeps + pdeps + [one_bc]
+                    if l3_tmp_last[tmp_i] is not None:
+                        start_deps.append(l3_tmp_last[tmp_i])
+
+                    b0 = add_op("valu", ("&", t1, p, one_v), start_deps)
+                    r0 = add_op("flow", ("vselect", node, t1, l3_tree_v[1], l3_tree_v[0]), [b0] + l3_bcs[:2])
+                    r1 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[3], l3_tree_v[2]), [r0] + l3_bcs[2:4])
+                    b1 = add_op("valu", ("&", tmp1, p, two_v), [r1, two_bc])
+                    n0 = add_op("flow", ("vselect", node, tmp1, tmp0, node), [b1, r1])
+
+                    b0_hi = add_op("valu", ("&", t1, p, one_v), [n0, one_bc])
+                    r2 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[5], l3_tree_v[4]), [b0_hi] + l3_bcs[4:6])
+                    r3 = add_op("flow", ("vselect", tmp1, t1, l3_tree_v[7], l3_tree_v[6]), [r2] + l3_bcs[6:8])
+                    b1_hi = add_op("valu", ("&", t1, p, two_v), [r3, two_bc])
+                    n1 = add_op("flow", ("vselect", tmp0, t1, tmp1, tmp0), [b1_hi, r3])
+                    b2 = add_op("valu", ("&", tmp1, p, four_v), [n1, four_bc])
+                    sel = add_op("flow", ("vselect", node, tmp1, tmp0, node), [b2, n1, n0])
+                    l3_tmp_last[tmp_i] = sel
                     node_deps = [sel]
                     node_addr = node
                 else:
-                    # Gather: node[lane] = mem[gather_base[level] + p[lane]]
-                    bc = add_op("valu", ("vbroadcast", node, gather_base_s[level]), prev)
-                    addr_op = add_op("valu", ("+", node, node, p), [bc])
+                    bc = add_op("valu", ("vbroadcast", node, gather_base_s[level]), vdeps)
+                    addr_op = add_op("valu", ("+", node, node, p), [bc] + pdeps)
                     loads = [
                         add_op("load", ("load_offset", node, node, lane), [addr_op])
                         for lane in range(VLEN)
@@ -323,16 +374,17 @@ class KernelBuilder:
                 final_val = add_hash(gi, g_val[gi], node_addr, node_deps, is_last)
 
                 if is_last:
-                    last[gi] = [final_val]
+                    last_val[gi] = [final_val]
+                    last_p[gi] = []
                 elif level == 0:
-                    # Next level is 1: new p = val & 1  (old p was 0, so 2*0+bit)
                     p_up = [
-                        add_op("alu", ("&", p + lane, g_val[gi] + lane, one_s), [final_val])
+                        add_op("alu", ("&", p + lane, g_val[gi] + lane, one_s),
+                               [final_val] + pdeps)
                         for lane in range(VLEN)
                     ]
-                    last[gi] = [final_val] + p_up
+                    last_val[gi] = [final_val]
+                    last_p[gi] = p_up
                 else:
-                    # p = 2*p + (val & 1)
                     bit = [
                         add_op("alu", ("&", t1 + lane, g_val[gi] + lane, one_s), [final_val])
                         for lane in range(VLEN)
@@ -340,13 +392,14 @@ class KernelBuilder:
                     p_up = add_op(
                         "valu",
                         ("multiply_add", p, p, two_v, t1),
-                        bit + [two_bc],
+                        bit + [two_bc] + pdeps,
                     )
-                    last[gi] = [final_val, p_up]
+                    last_val[gi] = [final_val]
+                    last_p[gi] = [p_up]
 
         # Store final values back.
         for gi in range(n_groups):
-            add_op("store", ("vstore", g_val_ptr[gi], g_val[gi]), last[gi])
+            add_op("store", ("vstore", g_val_ptr[gi], g_val[gi]), last_val[gi])
 
         # ---- List scheduler: earliest-ready, engine-packed ----
         n_ops = len(ops)

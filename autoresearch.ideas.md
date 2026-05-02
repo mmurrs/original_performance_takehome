@@ -23,3 +23,22 @@ Best seen (lost session): 1448.
 - To beat 1280, MUST eliminate gather rounds via arith-select.
 - L3 arith-select is feasible (est ~1300-1400 cycles post).
 - L4+ arith-select too expensive (VALU-bound >> load savings).
+
+## Current best: 1702 cycles (after flow add_imm for g_val_ptr)
+- -15 cycles from freeing 32 load slots in prolog
+- Further address moves to flow showed 0 gain (flow is 1/cycle, slower than load 2/cycle in bulk)
+
+## Remaining gap to target (1001)
+- 701 cycles of improvement needed
+- Load-bound min is 1296 (2628 slots / 2) — already within 400 cycles of it
+- To break 1001 MUST eliminate >= 3 gather rounds via arith-select
+
+## Why level-3 arith-select is hard
+- 8-way multilinear form needs 7 product-bit vectors + const vectors per group
+- Scratch budget exhausted at 1512/1536 with current design
+- Need aggressive scratch reuse: e.g., alias g_t2→g_node (blocks level-2), or eliminate g_t2 via in-place shifts but still need new slot for level-2 b1
+
+## Concrete next steps (blocked on scratch)
+1. In-place shifts (h1b/h3b/h5b → val not t2) + reshape level-2 to avoid g_t2 → free 256 words
+2. Then add level-3 arith-select with multilinear coefficients (save 2 rounds × 128 = 256 load cycles)
+3. Expected post: ~1400-1500 cycles
