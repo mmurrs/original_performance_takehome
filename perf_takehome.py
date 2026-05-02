@@ -373,7 +373,7 @@ class KernelBuilder:
 
                 final_val = add_hash(gi, g_val[gi], node_addr, node_deps, is_last)
 
-                if is_last:
+                if is_last or level == forest_height:
                     last_val[gi] = [final_val]
                     last_p[gi] = []
                 elif level == 0:
