@@ -482,9 +482,13 @@ class KernelBuilder:
         remaining = n_ops
         engine_rank = {"load": 0, "valu": 1, "alu": 2, "store": 3, "flow": 4, "debug": 5}
 
+        max_depth = max(asap[i] + priority[i] for i in range(n_ops)) if n_ops else 0
+        # Mobility = max_depth - (asap + priority). Low mobility = on critical path.
+        mobility = [max_depth - asap[i] - priority[i] for i in range(n_ops)]
+
         def sort_key(i):
             engine = ops[i][0]
-            return (engine_rank[engine], -priority[i], -asap[i], -i)
+            return (engine_rank[engine], mobility[i], -priority[i], -i)
 
         while remaining:
             bundle = {}
