@@ -145,9 +145,9 @@ class KernelBuilder:
         l1_diff_s = self.alloc_scratch("l1_diff_s")
         l2_diff0_s = self.alloc_scratch("l2_diff0_s")
         l2_diff1_s = self.alloc_scratch("l2_diff1_s")
-        l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(6)]
-        l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(6)]
-        l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(6)]
+        l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(4)]
+        l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(3)]
+        l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(3)]
 
         def emit_loads(slots):
             for i in range(0, len(slots), SLOT_LIMITS["load"]):
@@ -345,19 +345,34 @@ class KernelBuilder:
                     if l3_tmp_last[tmp_i] is not None:
                         start_deps.append(l3_tmp_last[tmp_i])
 
-                    b0 = add_op("valu", ("&", t1, p, one_v), start_deps)
-                    r0 = add_op("flow", ("vselect", node, t1, l3_tree_v[1], l3_tree_v[0]), [b0] + l3_bcs[:2])
+                    b0_alu = [
+                        add_op("alu", ("&", t1 + lane, p + lane, one_s), start_deps)
+                        for lane in range(VLEN)
+                    ]
+                    r0 = add_op("flow", ("vselect", node, t1, l3_tree_v[1], l3_tree_v[0]), b0_alu + l3_bcs[:2])
                     r1 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[3], l3_tree_v[2]), [r0] + l3_bcs[2:4])
-                    b1 = add_op("valu", ("&", tmp1, p, two_v), [r1, two_bc])
-                    n0 = add_op("flow", ("vselect", node, tmp1, tmp0, node), [b1, r1])
+                    b1_alu = [
+                        add_op("alu", ("&", tmp1 + lane, p + lane, two_s), [r1])
+                        for lane in range(VLEN)
+                    ]
+                    n0 = add_op("flow", ("vselect", node, tmp1, tmp0, node), b1_alu + [r1])
 
-                    b0_hi = add_op("valu", ("&", t1, p, one_v), [n0, one_bc])
-                    r2 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[5], l3_tree_v[4]), [b0_hi] + l3_bcs[4:6])
+                    b0_hi_alu = [
+                        add_op("alu", ("&", t1 + lane, p + lane, one_s), [n0])
+                        for lane in range(VLEN)
+                    ]
+                    r2 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[5], l3_tree_v[4]), b0_hi_alu + l3_bcs[4:6])
                     r3 = add_op("flow", ("vselect", tmp1, t1, l3_tree_v[7], l3_tree_v[6]), [r2] + l3_bcs[6:8])
-                    b1_hi = add_op("valu", ("&", t1, p, two_v), [r3, two_bc])
-                    n1 = add_op("flow", ("vselect", tmp0, t1, tmp1, tmp0), [b1_hi, r3])
-                    b2 = add_op("valu", ("&", tmp1, p, four_v), [n1, four_bc])
-                    sel = add_op("flow", ("vselect", node, tmp1, tmp0, node), [b2, n1, n0])
+                    b1_hi_alu = [
+                        add_op("alu", ("&", t1 + lane, p + lane, two_s), [r3])
+                        for lane in range(VLEN)
+                    ]
+                    n1 = add_op("flow", ("vselect", tmp0, t1, tmp1, tmp0), b1_hi_alu + [r3])
+                    b2_alu = [
+                        add_op("alu", ("&", tmp1 + lane, p + lane, four_s), [n1])
+                        for lane in range(VLEN)
+                    ]
+                    sel = add_op("flow", ("vselect", node, tmp1, tmp0, node), b2_alu + [n1, n0])
                     l3_tmp_last[tmp_i] = sel
                     node_deps = [sel]
                     node_addr = node
