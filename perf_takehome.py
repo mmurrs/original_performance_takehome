@@ -199,11 +199,18 @@ class KernelBuilder:
 
         hc_all_ready = hc_bcs + [one_bc, two_bc]
 
-        # Per-group pointer init + vload.
+        # g_val_ptr: base + gi*VLEN. Compute via flow add_imm (free engine)
+        # to avoid using 32 load slots for consts.
+        val_base_s = self.alloc_scratch("val_base_s")
+        const_ops[val_base_s] = add_op("load", ("const", val_base_s, inp_values_p))
         ptr_loads = []
         vloads = []
         for gi in range(n_groups):
-            pl = add_op("load", ("const", g_val_ptr[gi], inp_values_p + gi * VLEN))
+            if gi == 0:
+                # ptr[0] = val_base + 0 via flow
+                pl = add_op("flow", ("add_imm", g_val_ptr[gi], val_base_s, 0), [const_ops[val_base_s]])
+            else:
+                pl = add_op("flow", ("add_imm", g_val_ptr[gi], val_base_s, gi * VLEN), [const_ops[val_base_s]])
             ptr_loads.append(pl)
             vl = add_op("load", ("vload", g_val[gi], g_val_ptr[gi]), [pl])
             vloads.append(vl)
