@@ -357,19 +357,19 @@ class KernelBuilder:
                     sel = add_op(
                         "flow",
                         ("vselect", node, p, l1_base_v, l1_val1_v),
-                        vdeps + pdeps + [l1_base_bc, l1_val1_bc],
+                        pdeps + [l1_base_bc, l1_val1_bc],
                     )
                     node_deps = [sel]
                     node_addr = node
                 elif level == 2:
                     b1_tmp_i = gi % len(l2_b1_tmps)
-                    b1_deps = vdeps + pdeps + [two_bc]
+                    b1_deps = pdeps + [two_bc]
                     if l2_tmp_last[b1_tmp_i] is not None:
                         b1_deps.append(l2_tmp_last[b1_tmp_i])
                     b1_addr = l2_b1_tmps[b1_tmp_i]
                     b1 = add_op("valu", ("&", b1_addr, p, two_v), b1_deps)
                     r0 = add_op("flow", ("vselect", node, t1, l2_base0_v, l2_diff0_v),
-                                vdeps + pdeps + [l20_base_bc, l20_diff_bc])
+                                pdeps + [l20_base_bc, l20_diff_bc])
                     r1 = add_op("flow", ("vselect", t1, t1, l2_base1_v, l2_diff1_v),
                                 [r0, l21_base_bc, l21_diff_bc])
                     sel = add_op("flow", ("vselect", node, b1_addr, node, t1), [r1, b1])
@@ -383,7 +383,7 @@ class KernelBuilder:
                     tmp0 = l3_tmp0[tmp_i]
                     tmp1 = l3_tmp1[tmp_i]
                     tmp2 = l3_tmp2[tmp_i]
-                    start_deps = vdeps + pdeps
+                    start_deps = list(pdeps)
                     if l3_tmp_last[tmp_i] is not None:
                         start_deps.append(l3_tmp_last[tmp_i])
 
