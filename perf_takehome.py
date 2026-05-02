@@ -170,10 +170,12 @@ class KernelBuilder:
             const_load_ops.append((s2, c2))
         for level, dest in gather_base_s.items():
             const_load_ops.append((dest, forest_values_p + (1 << level) - 1))
-        for i, dest in enumerate(tree_s):
-            const_load_ops.append((dest, forest_values_p + i))
-        for i, dest in enumerate(l3_tree_s):
-            const_load_ops.append((dest, forest_values_p + 7 + i))
+        # Allocate a scratch pointer pointing to forest_values_p for the vload
+        # that loads tree values (tree_s[0..6] + l3_tree_s[0..7] = 15 consecutive).
+        tree_vload_ptr = self.alloc_scratch("tree_vload_ptr")
+        tree_vload_ptr_2 = self.alloc_scratch("tree_vload_ptr_2")
+        const_load_ops.append((tree_vload_ptr, forest_values_p))
+        const_load_ops.append((tree_vload_ptr_2, forest_values_p + 7))
 
         # ---- Scheduled body ----
         ops = []
@@ -187,13 +189,16 @@ class KernelBuilder:
         const_ops = {}  # dest -> op_idx
         for dest, val in const_load_ops:
             const_ops[dest] = add_op("load", ("const", dest, val))
-        # Load the first 7 tree values (levels 0, 1, 2).
-        tree_load_ops = []
-        for dest in tree_s:
-            tree_load_ops.append(add_op("load", ("load", dest, dest), [const_ops[dest]]))
-        l3_tree_load_ops = []
-        for dest in l3_tree_s:
-            l3_tree_load_ops.append(add_op("load", ("load", dest, dest), [const_ops[dest]]))
+        # Load the first 7 tree values (levels 0, 1, 2) + level-3 (8 more) via
+        # 2 vloads instead of 15 scalar load_consts + 15 loads. tree_s[0..6] +
+        # l3_tree_s[0..7] are contiguous in scratch (sequential alloc), matching
+        # mem[forest_values_p..forest_values_p+14].
+        # First vload: tree_s[0..6] + l3_tree_s[0] (8 values).
+        # Second vload: l3_tree_s[0..7] (8 values, overlapping at l3_tree_s[0]).
+        v1 = add_op("load", ("vload", tree_s[0], tree_vload_ptr), [const_ops[tree_vload_ptr]])
+        v2 = add_op("load", ("vload", l3_tree_s[0], tree_vload_ptr_2), [const_ops[tree_vload_ptr_2]])
+        tree_load_ops = [v1] * 7  # tree_s[0..6] all loaded by v1
+        l3_tree_load_ops = [v2] * 8  # l3_tree_s[0..7] all loaded by v2
 
         # Broadcasts & level-setup subs as deps in the scheduled body, so they
         # pipeline with early group work.
