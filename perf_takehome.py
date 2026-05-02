@@ -204,9 +204,12 @@ class KernelBuilder:
         two_bc = add_op("valu", ("vbroadcast", two_v, two_s), [const_ops[two_s]])
         four_bc = add_op("valu", ("vbroadcast", four_v, four_s), [const_ops[four_s]])
         hc_bcs = []
-        for (v1, v2), (s1, s2) in zip(hash_vecs, hash_scalars):
+        for hi, ((v1, v2), (s1, s2)) in enumerate(zip(hash_vecs, hash_scalars)):
             hc_bcs.append(add_op("valu", ("vbroadcast", v1, s1), [const_ops[s1]]))
-            hc_bcs.append(add_op("valu", ("vbroadcast", v2, s2), [const_ops[s2]]))
+            if hi in (1, 3):
+                hc_bcs.append(const_ops[s2])
+            else:
+                hc_bcs.append(add_op("valu", ("vbroadcast", v2, s2), [const_ops[s2]]))
         root_bc = add_op("valu", ("vbroadcast", root_v, tree_s[0]), [tree_load_ops[0]])
         l1_base_bc = add_op("valu", ("vbroadcast", l1_base_v, tree_s[1]), [tree_load_ops[1]])
         l1_diff_bc = add_op("valu", ("vbroadcast", l1_diff_v, l1_diff_s), [diff_l1])
@@ -322,7 +325,6 @@ class KernelBuilder:
                     node_deps = [sel]
                     node_addr = node
                 elif level == 2:
-                    b0 = add_op("valu", ("&", t1, p, one_v), vdeps + pdeps + [one_bc])
                     b1_tmp_i = gi % len(l2_b1_tmps)
                     b1_deps = vdeps + pdeps + [two_bc]
                     if l2_tmp_last[b1_tmp_i] is not None:
@@ -330,7 +332,7 @@ class KernelBuilder:
                     b1_addr = l2_b1_tmps[b1_tmp_i]
                     b1 = add_op("valu", ("&", b1_addr, p, two_v), b1_deps)
                     r0 = add_op("flow", ("vselect", node, t1, l2_diff0_v, l2_base0_v),
-                                [b0, l20_base_bc, l20_diff_bc])
+                                vdeps + pdeps + [l20_base_bc, l20_diff_bc])
                     r1 = add_op("flow", ("vselect", t1, t1, l2_diff1_v, l2_base1_v),
                                 [r0, l21_base_bc, l21_diff_bc])
                     sel = add_op("flow", ("vselect", node, b1_addr, t1, node), [r1, b1])
@@ -344,15 +346,11 @@ class KernelBuilder:
                     tmp0 = l3_tmp0[tmp_i]
                     tmp1 = l3_tmp1[tmp_i]
                     tmp2 = l3_tmp2[tmp_i]
-                    start_deps = vdeps + pdeps + [one_bc]
+                    start_deps = vdeps + pdeps
                     if l3_tmp_last[tmp_i] is not None:
                         start_deps.append(l3_tmp_last[tmp_i])
 
-                    b0_alu = [
-                        add_op("alu", ("&", t1 + lane, p + lane, one_s), start_deps)
-                        for lane in range(VLEN)
-                    ]
-                    r0 = add_op("flow", ("vselect", node, t1, l3_tree_v[1], l3_tree_v[0]), b0_alu + l3_bcs[:2])
+                    r0 = add_op("flow", ("vselect", node, t1, l3_tree_v[1], l3_tree_v[0]), start_deps + l3_bcs[:2])
                     r1 = add_op("flow", ("vselect", tmp0, t1, l3_tree_v[3], l3_tree_v[2]), [r0] + l3_bcs[2:4])
                     b1_alu = [
                         add_op("alu", ("&", tmp1 + lane, p + lane, two_s), [r1])
@@ -378,7 +376,7 @@ class KernelBuilder:
                                       vdeps + pdeps + [gb_bcs[level]])
                     loads = [
                         add_op("load", ("load_offset", node, node, lane), [addr_op])
-                        for lane in range(VLEN)
+                        for lane in range(VLEN - 1, -1, -1)
                     ]
                     node_deps = loads
                     node_addr = node
