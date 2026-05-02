@@ -488,7 +488,7 @@ class KernelBuilder:
 
         def sort_key(i):
             engine = ops[i][0]
-            return (engine_rank[engine], mobility[i], -priority[i], -i)
+            return (engine_rank[engine], mobility[i], -priority[i], i)
 
         while remaining:
             bundle = {}
