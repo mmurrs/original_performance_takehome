@@ -81,13 +81,14 @@ class KernelBuilder:
         n_groups = batch_size // VLEN
         forest_values_p = 7
         inp_values_p = forest_values_p + n_nodes + batch_size
-        h3a_alu_rounds = {15}
+        h3a_alu_rounds = set()
+        p_bit_valu_rounds = {9, 14}
 
         # ---- scratch allocations ----
         one_s = self.alloc_scratch("one_s")
         two_s = self.alloc_scratch("two_s")
         four_s = self.alloc_scratch("four_s")
-        one_v = self.alloc_scratch("one_v", VLEN)
+        one_v = self.alloc_scratch("one_v", VLEN) if p_bit_valu_rounds else None
         two_v = self.alloc_scratch("two_v", VLEN)
         four_v = self.alloc_scratch("four_v", VLEN)
 
@@ -114,7 +115,6 @@ class KernelBuilder:
 
         root_v = self.alloc_scratch("root_v", VLEN)
         l1_base_v = self.alloc_scratch("l1_base_v", VLEN)
-        l1_diff_v = self.alloc_scratch("l1_diff_v", VLEN)
         l1_val1_v = self.alloc_scratch("l1_val1_v", VLEN)
         l2_base0_v = self.alloc_scratch("l2_base0_v", VLEN)
         l2_diff0_v = self.alloc_scratch("l2_diff0_v", VLEN)
@@ -148,9 +148,6 @@ class KernelBuilder:
         tree_s = [self.alloc_scratch(f"tree{i}_s") for i in range(7)]
         l3_tree_s = [self.alloc_scratch(f"l3_tree{i}_s") for i in range(8)]
         l3_tree_v = [self.alloc_scratch(f"l3_tree{i}_v", VLEN) for i in range(8)]
-        l1_diff_s = self.alloc_scratch("l1_diff_s")
-        l2_diff0_s = self.alloc_scratch("l2_diff0_s")
-        l2_diff1_s = self.alloc_scratch("l2_diff1_s")
         l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(1)]
         l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(2)]
         l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(2)]
@@ -199,9 +196,10 @@ class KernelBuilder:
 
         # Broadcasts & level-setup subs as deps in the scheduled body, so they
         # pipeline with early group work.
-        diff_l1 = add_op("alu", ("-", l1_diff_s, tree_s[2], tree_s[1]), [tree_load_ops[1], tree_load_ops[2]])
-
-        one_bc = add_op("valu", ("vbroadcast", one_v, one_s), [const_ops[one_s]])
+        one_bc = (
+            add_op("valu", ("vbroadcast", one_v, one_s), [const_ops[one_s]])
+            if p_bit_valu_rounds else None
+        )
         two_bc = add_op("valu", ("vbroadcast", two_v, two_s), [const_ops[two_s]])
         four_bc = add_op("valu", ("vbroadcast", four_v, four_s), [const_ops[four_s]])
         hc_bcs = []
@@ -213,7 +211,6 @@ class KernelBuilder:
                 hc_bcs.append(add_op("valu", ("vbroadcast", v2, s2), [const_ops[s2]]))
         root_bc = add_op("valu", ("vbroadcast", root_v, tree_s[0]), [tree_load_ops[0]])
         l1_base_bc = add_op("valu", ("vbroadcast", l1_base_v, tree_s[1]), [tree_load_ops[1]])
-        l1_diff_bc = add_op("valu", ("vbroadcast", l1_diff_v, l1_diff_s), [diff_l1])
         l1_val1_bc = add_op("valu", ("vbroadcast", l1_val1_v, tree_s[2]), [tree_load_ops[2]])
         l20_base_bc = add_op("valu", ("vbroadcast", l2_base0_v, tree_s[3]), [tree_load_ops[3]])
         l20_diff_bc = add_op("valu", ("vbroadcast", l2_diff0_v, tree_s[4]), [tree_load_ops[4]])
@@ -230,7 +227,7 @@ class KernelBuilder:
             for vec, scalar, load_op in zip(l3_tree_v, l3_tree_s, l3_tree_load_ops)
         ]
 
-        hc_all_ready = hc_bcs + [one_bc, two_bc]
+        hc_all_ready = hc_bcs + [const_ops[one_s], two_bc]
 
         # g_val_ptr: base + gi*VLEN. Compute via flow add_imm (free engine)
         # to avoid using 32 load slots for consts.
@@ -395,18 +392,24 @@ class KernelBuilder:
                     last_val[gi] = [final_val]
                     last_p[gi] = []
                 elif level == 0:
-                    p_up = [
-                        add_op("alu", ("&", p + lane, g_val[gi] + lane, one_s),
-                               [final_val] + pdeps)
-                        for lane in range(VLEN)
-                    ]
+                    if round_i in p_bit_valu_rounds:
+                        p_up = [add_op("valu", ("&", p, g_val[gi], one_v), [final_val, one_bc] + pdeps)]
+                    else:
+                        p_up = [
+                            add_op("alu", ("&", p + lane, g_val[gi] + lane, one_s),
+                                   [final_val] + pdeps)
+                            for lane in range(VLEN)
+                        ]
                     last_val[gi] = [final_val]
                     last_p[gi] = p_up
                 else:
-                    bit = [
-                        add_op("alu", ("&", t1 + lane, g_val[gi] + lane, one_s), [final_val])
-                        for lane in range(VLEN)
-                    ]
+                    if round_i in p_bit_valu_rounds:
+                        bit = [add_op("valu", ("&", t1, g_val[gi], one_v), [final_val, one_bc])]
+                    else:
+                        bit = [
+                            add_op("alu", ("&", t1 + lane, g_val[gi] + lane, one_s), [final_val])
+                            for lane in range(VLEN)
+                        ]
                     p_up = add_op(
                         "valu",
                         ("multiply_add", p, p, two_v, t1),
