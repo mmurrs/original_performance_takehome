@@ -150,7 +150,7 @@ class KernelBuilder:
         l1_diff_s = self.alloc_scratch("l1_diff_s")
         l2_diff0_s = self.alloc_scratch("l2_diff0_s")
         l2_diff1_s = self.alloc_scratch("l2_diff1_s")
-        l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(2)]
+        l2_b1_tmps = [self.alloc_scratch(f"l2_b1_tmp{i}", VLEN) for i in range(1)]
         l3_tmp0 = [self.alloc_scratch(f"l3_tmp0_{i}", VLEN) for i in range(2)]
         l3_tmp1 = [self.alloc_scratch(f"l3_tmp1_{i}", VLEN) for i in range(2)]
         l3_tmp2 = [self.alloc_scratch(f"l3_tmp2_{i}", VLEN) for i in range(2)]

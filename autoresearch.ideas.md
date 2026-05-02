@@ -1,44 +1,39 @@
-# Autoresearch ideas / backlog
+# Autoresearch: VLIW SIMD Kernel Optimization
 
-## Stuck region: 1717 cycles
-Load engine at 1330 slots (99.9% packed). VALU theoretical 1193, ALU 1003.
-Best seen (lost session): 1448.
+## Current best: 1154 cycles (from 147734 baseline)
 
-## High-value ideas not yet explored
-- **Merge g_node into g_t1** (alias them) to free 256 scratch words → enables level-3 arith-select.
-- **Eliminate g_t2** via in-place shift: `h1b: val >> c -> val; h1c: t1 ^ val -> val`. Would save 256 scratch words.
-- **Level-3 arith-select** via multilinear expansion: `result = A + B*b0 + C*b1 + D*b2 + E*b0b1 + F*b0b2 + G*b1b2 + H*b0b1b2`. 8 const broadcasts + 3 bit extracts + 4 product mads + 7 accumulator mads. Saves 256 load cycles over 2 rounds. Needs scratch savings first.
-- **Cross-round dep relaxation**: track fine-grained fences (node-WAR via x0, t1/t2-WAR via final_val, p-WAR via prev p_up). Previous attempt failed correctness — need careful bookkeeping.
-- **Better scheduler priority**: try (-priority, engine_rank, round_index) to prefer earlier rounds' ops. Or weight by resource pressure.
-- **Tree prefetch**: preload entire levels 3..6 into scratch (127 values) during setup → then everything below level 7 can be arith-selected. But load_offset still hits memory, so unclear benefit.
-- **LSB of final_val without full stage 5**: LSB(final) = LSB(val_post4) ^ bit16(val_post4) ^ 1. Could start next-round gather earlier by computing p bit pre-stage-5.
+## Profile (at 1154)
+- ALU: 12801 slots, 1067 min (fully packed)
+- VALU: 6502 slots, 1084 min (bottleneck: 94% utilization)
+- LOAD: 2133 slots, 1067 min
+- FLOW: 736 slots, 736 min
+- Scratch: 1465/1536 (71 free)
 
-## Dead ends
-- Algebraic refactor of level-2 (3-mad chain) — longer critical path than tree form.
-- Moving stage-1,5 shifts both to ALU — over-saturates ALU.
-- Moving level-2 bit extracts to ALU — ALU is 12-wide but during level-0/1/2 rounds other ALU work already saturates.
+## Key optimizations in place
+1. Vectorized 32 groups × VLEN=8
+2. multiply_add for hash stages 0, 2, 4 (constants: 4097, 33, 9)
+3. Stage 1, 3 shifts on per-lane ALU (freed valu slots)
+4. Level-0 uses root_v broadcast (no gather/select)
+5. Level-1 uses vselect (flow engine) with 2 precomputed broadcast vectors
+6. Level-2 uses 3-vselect tree (flow)
+7. Level-3 uses 7-vselect binary tree (flow) with shared l3_tmp0/1/2 slots
+8. Level-4+ uses gather with precomputed base vectors
+9. g_val_ptr via flow add_imm (frees 32 load slots)
+10. x0-based node_war tracking (decoupled cross-round node dep)
+11. Split val/p dep chains (level-0 skip p)
+12. Bit extracts on per-lane ALU (p_update, level-3 b0/b1)
+13. g_t2 aliased to g_node (shared scratch)
 
-## Notes
-- Bottleneck is inherently gather-load throughput at 1280 min (10 rounds × 256 / 2).
-- To beat 1280, MUST eliminate gather rounds via arith-select.
-- L3 arith-select is feasible (est ~1300-1400 cycles post).
-- L4+ arith-select too expensive (VALU-bound >> load savings).
+## Remaining ideas
+- **Early LSB via algebra**: LSB(val_post5) = LSB(val_post4) ^ bit16(val_post4) ^ 1.
+  Analysis: same critical depth as current, so no speedup.
+- **Level-4 arith-select**: 15 vselects/group would push flow to 1440 min — worse than current.
+- **Combined hash stage fusion**: XOR doesn't distribute over +/*, so no algebraic simplification.
+- **Scheduler improvements**: tried ASAP-first, priority-first — no improvement. Greedy is near-optimal here.
 
-## Current best: 1702 cycles (after flow add_imm for g_val_ptr)
-- -15 cycles from freeing 32 load slots in prolog
-- Further address moves to flow showed 0 gain (flow is 1/cycle, slower than load 2/cycle in bulk)
-
-## Remaining gap to target (1001)
-- 701 cycles of improvement needed
-- Load-bound min is 1296 (2628 slots / 2) — already within 400 cycles of it
-- To break 1001 MUST eliminate >= 3 gather rounds via arith-select
-
-## Why level-3 arith-select is hard
-- 8-way multilinear form needs 7 product-bit vectors + const vectors per group
-- Scratch budget exhausted at 1512/1536 with current design
-- Need aggressive scratch reuse: e.g., alias g_t2→g_node (blocks level-2), or eliminate g_t2 via in-place shifts but still need new slot for level-2 b1
-
-## Concrete next steps (blocked on scratch)
-1. In-place shifts (h1b/h3b/h5b → val not t2) + reshape level-2 to avoid g_t2 → free 256 words
-2. Then add level-3 arith-select with multilinear coefficients (save 2 rounds × 128 = 256 load cycles)
-3. Expected post: ~1400-1500 cycles
+## Hard bottleneck
+- 10 gather rounds at 128 load cycles each = 1280 min load → reduced to 1067 via L3 arith-select
+- Hash critical path ~10-11 valu stages per round × pipelining → 1084 min valu
+- Gap to 1001 requires either:
+  - Reducing hash stage count (no known way with this ISA)
+  - Eliminating more gather rounds (L4+ too expensive)
