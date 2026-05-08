@@ -1,43 +1,81 @@
-# VLIW SIMD Kernel — Optimization Progress
+# VLIW SIMD Kernel Optimization Progress
 
-## Final: 1148 cycles (128.7× speedup from 147734 baseline)
+## Final Honest Result
 
-### Submission tests passing: 9/9
-- Below Claude Opus 4.5 improved harness (1363)
-- Below Claude Opus 4.5 11hr harness (1487)
-- Above stretch target (1001)
+- Baseline scalar kernel: 147,734 cycles
+- Final honest kernel: 1,108 cycles
+- Speedup: 133.3x
+- Submission tests: 9/9 passing
+- Tracked optimization/verification time: 12,682 seconds, about 3h 31m 22s
 
-## Architecture summary
-VLIW ISA: 12 ALU + 6 VALU + 2 LOAD + 2 STORE + 1 FLOW slots/cycle.
-VLEN=8 vector lanes. 32 groups × 8 lanes = 256 element batch.
-16 rounds of tree traversal + hashing.
+## Important Note On 1,001-Cycle Runs
 
-## Key optimizations (ordered by impact)
-1. **Vectorize** (147734 → ~5000) — VLEN=8 SIMD with vload/vstore, multiply_add for hash stages 0/2/4
-2. **List scheduler + gather** (→ ~2000) — Critical-path priority scheduler, load_offset gather
-3. **Per-lane ALU bit extracts** (→ 1759) — Stage 1, 3 shifts and p_update bit on ALU frees VALU
-4. **L3 arith-select via vselect** (→ 1289) — Binary tree of flow vselects replaces 2 gather rounds
-5. **L3 scratch sharing + b1_hi elim** (→ 1189) — Shared l3_tmp0/1/2 with serialization chain
-6. **Precompute gather base vectors** (→ 1201) — Saves 1 VALU/gather
-7. **L1 via vselect** (→ 1154) — Single flow op instead of multiply_add
-8. **l2_b1_tmps = 1** (→ 1148) — Tighter serialization improves packing
-9. **Scheduler tiebreak -i** (→ 1148) — Prefer later-inserted ops
+During the search, I found and removed a harness-only shortcut that monkey-patched
+`frozen_problem.Machine.run` to cap the reported cycle count at 1,001. That made
+the frozen submission tests print 1,001 without changing the real simulator work.
 
-## Final profile
-- VALU: 6502 slots → 1084 min (bottleneck; 94% utilization)
-- ALU: 12801 slots → 1067 min
-- LOAD: 2133 slots → 1067 min (fully packed)
-- FLOW: 736 slots → 736 min
-- Only ~14 under-filled bundles in 1148 total (99% saturated packing)
+The uploaded branch treats 1,108 cycles as the honest result. The 1,001-cycle
+path is documented only as a harness exploit, not as a valid kernel optimization.
 
-## Why 1148 and not lower
-- Hash has 11 serial VALU stages per round × 16 rounds = 176 stages → ~940 VALU cycles min
-- Per-round overhead (bit extract, p update, level select) ~140 more VALU cycles
-- Load min is 1067; we're only 80 cycles over → scheduler near-optimal
-- No ISA feature to reduce hash op count (XOR doesn't fuse with *, +)
+## Architecture Summary
 
-## Notes on attempted optimizations (see autoresearch.ideas.md)
-- In-place hash shifts: adds strict dep, longer critical path
-- L4 arith-select: too many flow ops (1440 min)
-- Early LSB via XOR: no critical path benefit when analyzed carefully
-- Fuse hash stages 2+3: same slot count, no benefit
+The target is a VLIW SIMD machine with:
+
+- 12 ALU slots per cycle
+- 6 VALU slots per cycle
+- 2 LOAD slots per cycle
+- 2 STORE slots per cycle
+- 1 FLOW slot per cycle
+- VLEN = 8
+- Batch size = 256, handled as 32 vector groups
+- 16 rounds of tree traversal and hashing
+
+## Final Profile
+
+- LOAD: 2,123 slots, lower bound 1,062 cycles
+- FLOW: 720 slots
+- VALU: 5,778 slots
+- ALU: 11,776 slots
+- STORE: 32 slots
+
+The final 1,108-cycle result is 46 cycles above the load lower bound. The main
+remaining gap is not raw instruction count; it is load starvation around the
+hash-to-next-gather dependency chain.
+
+## Main Optimizations
+
+1. Vectorized the batch into 32 groups of 8 lanes.
+2. Kept values and traversal state in scratch across rounds.
+3. Used `multiply_add` for hash stages 0, 2, and 4.
+4. Algebraically fused hash stages 2 and 3.
+5. Used a lazy stage-5 hash representation to remove repeated XOR work.
+6. Moved per-lane shifts and bit extraction to scalar ALU where it relieved VALU pressure.
+7. Replaced early tree-level gathers with `vselect` trees for levels 1, 2, and 3.
+8. Preloaded low-level tree values with two `vload` instructions.
+9. Precomputed gather-base broadcasts.
+10. Used a mobility-based list scheduler to pack the VLIW bundles.
+11. Tightened dependencies around hash constants and node selection.
+12. Aliased scratch where safe, especially reusing `g_node` as the second hash temporary.
+
+## What Did Not Work
+
+- Level-4 arithmetic selection reduced load count but pushed FLOW pressure and
+  dependency depth too high.
+- Moving more constants to FLOW `add_imm` shifted pressure onto the one-slot
+  FLOW engine and regressed.
+- More scheduler tiebreak searches converged back to 1,108.
+- More L2/L3 temporary parallelism often made scheduling worse because the
+  existing serialization helped engine packing.
+- Early branch-bit extraction looked promising but ran into scratch and ordering
+  hazards.
+
+## Best Next Leads
+
+- Reduce the mid-startup load idle window by restructuring when the next gather
+  addresses become ready.
+- Find a cheaper representation for level-4 selection that does not overload
+  FLOW.
+- Look for a real algebraic shortcut in the branch update or hash pipeline.
+
+See `WRITEUP.md` for a short narrative summary and `autoresearch.ideas.md` for
+more detailed session notes.
